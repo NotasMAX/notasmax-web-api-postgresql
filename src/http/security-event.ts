@@ -1,4 +1,9 @@
-import type { InvocationContext } from "@azure/functions";
+import type { HttpRequest, HttpResponseInit, InvocationContext } from "@azure/functions";
+
+type SecurityEventHandler = (
+  request: HttpRequest,
+  context: InvocationContext
+) => Promise<HttpResponseInit>;
 
 export function logSecurityEvent(
   context: InvocationContext,
@@ -16,4 +21,19 @@ export function logSecurityEvent(
   } catch {
     // Logging failure must not change an account operation result.
   }
+}
+
+export function withSecurityEvent(event: string, handler: SecurityEventHandler): SecurityEventHandler {
+  return async (request, context) => {
+    const startedAt = Date.now();
+    let result = "failed";
+    try {
+      const response = await handler(request, context);
+      const status = response.status ?? 200;
+      result = status >= 500 ? "failed" : status >= 400 ? "rejected" : "completed";
+      return response;
+    } finally {
+      logSecurityEvent(context, event, result, startedAt);
+    }
+  };
 }

@@ -176,6 +176,43 @@ As mutações administrativas e os resultados de reautenticação emitem eventos
 
 As exclusões são lógicas e revogam sessões sem apagar vínculos. O aluno só é bloqueado quando tem matrícula ativa e vínculo com simulado realizado (`409 STUDENT_CANNOT_BE_DELETED`); o professor é bloqueado enquanto houver associação a matéria/turma (`409 TEACHER_HAS_LINKED_DATA`). Administradores não podem excluir a própria conta (`409 ADMINISTRATOR_CANNOT_DELETE_SELF`) nem remover o último administrador ativo (`409 LAST_ACTIVE_ADMIN_CANNOT_BE_DELETED`). As mutações das associações validam a oferta turma/matéria e o perfil ativo do professor no servidor, são transacionais e não criam histórico. IDs inexistentes ou combinações incompatíveis retornam `404 RESOURCE_NOT_FOUND` com RFC 9457.
 
+## Administração de matérias
+
+Todas as rotas de matérias exigem sessão ativa de administrador. As mutações também exigem `Origin` permitido e `X-Requested-With: XMLHttpRequest`.
+
+| Método e rota | Finalidade |
+|---|---|
+| `GET /api/v1/admin/subjects` | Lista matérias ativas. Aceita `search` por nome, `page` e `pageSize`; a ordenação é por nome crescente. |
+| `POST /api/v1/admin/subjects` | Cria matéria com `name` obrigatório (até 120 caracteres) e `description` opcional (até 500). Retorna `201` com `{ subjectId, name, description }`. |
+| `PATCH /api/v1/admin/subjects/{subjectId}` | Atualiza parcialmente `name` e/ou `description`; `description: null` limpa a descrição. Retorna `200` com o recurso atualizado. |
+| `DELETE /api/v1/admin/subjects/{subjectId}` | Faz exclusão lógica e retorna `204`; a operação é idempotente. Vínculo com turma ativa retorna `409 SUBJECT_HAS_CLASS_LINKS`. |
+
+A lista retorna `{ items: [{ subjectId, name, description }], pagination: { page, pageSize, totalItems, totalPages } }`, com `page=1`, `pageSize=20` e máximo de 100 itens por página. O nome é armazenado sem espaços externos; nomes de matérias ativas não podem se repetir sem diferença de maiúsculas/minúsculas. A duplicidade retorna `409 SUBJECT_ALREADY_EXISTS`; o nome pode ser reutilizado após a exclusão lógica. PATCH com corpo vazio retorna `422 VALIDATION_ERROR`; ID inexistente retorna `404 SUBJECT_NOT_FOUND`. Respostas de erro usam RFC 9457 e não expõem mensagens internas do PostgreSQL.
+
+## Administração de turmas e ofertas de matérias
+
+Todas as rotas abaixo exigem sessão ativa de administrador. As mutações também exigem `Origin` presente e permitido pela allowlist exata e `X-Requested-With: XMLHttpRequest`. As respostas de erro seguem RFC 9457 e não expõem erros crus do PostgreSQL.
+
+| Método e rota | Finalidade |
+|---|---|
+| `GET /api/v1/admin/classes` | Lista turmas ativas por `schoolYear`, com paginação. O ano é opcional e, quando omitido, usa o ano-calendário atual. |
+| `GET /api/v1/admin/classes/years` | Lista, em ordem decrescente e sem paginação, os anos letivos que têm turmas ativas. |
+| `POST /api/v1/admin/classes` | Cria turma com `series` e `schoolYear`; retorna `201` com `{ classId, series, schoolYear }`. |
+| `GET /api/v1/admin/classes/{classId}` | Consulta os dados básicos da turma ativa. |
+| `PATCH /api/v1/admin/classes/{classId}` | Atualiza parcialmente `series` e/ou `schoolYear`; corpo vazio retorna `422 VALIDATION_ERROR`. |
+| `DELETE /api/v1/admin/classes/{classId}` | Faz exclusão lógica e retorna `204`; repetir a exclusão também retorna `204`. |
+| `GET /api/v1/admin/classes/{classId}/subjects` | Lista matérias ativas oferecidas à turma, sem paginação e em ordem crescente por nome. |
+| `PUT /api/v1/admin/classes/{classId}/subjects/{subjectId}` | Associa matéria ativa à turma; operação idempotente, retorna `204`. |
+| `DELETE /api/v1/admin/classes/{classId}/subjects/{subjectId}` | Remove a oferta e as associações atuais de professores; operação idempotente, retorna `204` quando a turma e a matéria estão ativas. |
+
+A lista de turmas retorna `{ items: [{ classId, series, schoolYear }], pagination: { page, pageSize, totalItems, totalPages } }`, com `page=1`, `pageSize=20`, máximo de 100 itens e ordenação por ano letivo e série. `/classes/years` retorna `{ items: [{ schoolYear }] }`. As séries aceitas são os inteiros `1`, `2` e `3`; o ano letivo é inteiro, sem limite temporal. Há uma turma ativa por combinação série/ano; a combinação pode ser reutilizada depois da exclusão lógica. Duplicidade ativa retorna `409 CLASS_ALREADY_EXISTS`.
+
+O PATCH de série ou ano retorna `409 CLASS_HAS_LINKED_DATA` enquanto houver matrícula, oferta ou simulado vinculado. A exclusão lógica da turma é bloqueada por matrícula vigente na data da operação, oferta associada ou simulado ativo. Para esta regra, simulado ativo é aquele sem confirmação de realização e sem exclusão lógica; a data agendada não altera o estado. Matrículas encerradas ou canceladas, e simulados confirmados ou cancelados, não bloqueiam a exclusão da turma. IDs de turma inexistentes ou excluídos em operações por ID retornam `404 CLASS_NOT_FOUND`.
+
+A oferta exige turma e matéria ativas; IDs inexistentes, excluídos ou incompatíveis retornam `404 RESOURCE_NOT_FOUND`. Um simulado com `instante_confirmacao_realizacao` preenchido bloqueia a remoção da matéria com `409 SUBJECT_HAS_COMPLETED_SIMULATIONS`. Em simulados sem confirmação, qualquer linha em `resultado` bloqueia a remoção com `409 SUBJECT_HAS_SIMULATION_RESULTS` e os resultados são preservados. Sem resultados, a API remove a matéria desses simulados, apaga somente as associações atuais de professores e remove a oferta na mesma transação. Cadastros de professores não são apagados nem há restauração ou histórico de associações.
+
+A migration `202610100001_class_logical_deletion.js` adiciona `turma.excluido_em TIMESTAMPTZ` e substitui a unicidade geral de série/ano por um índice único parcial para turmas ativas. Migrations históricas não são alteradas.
+
 ## Testes e verificações
 
 Execute o lint, a verificação de tipos e a compilação:

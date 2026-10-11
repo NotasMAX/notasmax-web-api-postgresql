@@ -3,7 +3,7 @@ import type { Knex } from "knex";
 import { z } from "zod";
 import { getKnex } from "../database/knex";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
-import { logSecurityEvent } from "../http/security-event";
+import { logSecurityEvent, withSecurityEvent } from "../http/security-event";
 import {
   authenticationFailed,
   configuredOrigins,
@@ -108,21 +108,6 @@ type RequestHandler = (
   request: HttpRequest,
   context: InvocationContext
 ) => Promise<HttpResponseInit>;
-
-function withSecurityEvent(event: string, handler: RequestHandler): RequestHandler {
-  return async (request, context) => {
-    const startedAt = Date.now();
-    let result = "failed";
-    try {
-      const response = await handler(request, context);
-      const status = response.status ?? 200;
-      result = status >= 500 ? "failed" : status >= 400 ? "rejected" : "completed";
-      return response;
-    } finally {
-      logSecurityEvent(context, event, result, startedAt);
-    }
-  };
-}
 
 export type AdminAccountHandlerOptions = {
   getDatabase?: () => Knex;

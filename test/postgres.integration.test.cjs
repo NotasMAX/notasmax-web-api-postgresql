@@ -12,6 +12,8 @@ const { assertLoopbackHost } = require("../src/database/local-only.cjs");
 const { createInitialAdmin } = require("../seed/admin.cjs");
 const { createAuthHandlers, requireAdminSession } = require("../dist/auth/handler.js");
 const { createAdminAccountHandlers } = require("../dist/auth/admin-account-handler.js");
+const { createAdminClassHandlers } = require("../dist/auth/admin-class-handler.js");
+const { createAdminSubjectHandlers } = require("../dist/auth/admin-subject-handler.js");
 const { createAccountLifecycleHandlers } = require("../dist/auth/account-lifecycle-handler.js");
 const { deleteAccount, updateAccount } = require("../dist/auth/admin-account-service.js");
 const {
@@ -158,6 +160,72 @@ function adminAccountHandlers(database, emailTransport) {
   });
 }
 
+function adminSubjectHandlers(database) {
+  return createAdminSubjectHandlers({
+    getDatabase: () => database,
+    allowedOrigins: [AUTH_ORIGIN]
+  });
+}
+
+function adminClassHandlers(database) {
+  return createAdminClassHandlers({
+    getDatabase: () => database,
+    allowedOrigins: [AUTH_ORIGIN]
+  });
+}
+
+let academicFixtureCounter = 0;
+let schoolYearFixtureCounter = 0;
+
+function nextSchoolYear() {
+  schoolYearFixtureCounter += 1;
+  return 1000000 + schoolYearFixtureCounter;
+}
+
+async function insertClass(database, { series = 1, schoolYear = nextSchoolYear() } = {}) {
+  const [row] = await database("turma")
+    .insert({ serie: series, ano_letivo: schoolYear })
+    .returning("id_turma");
+  return String(row.id_turma);
+}
+
+async function insertSubject(database, name = `Phase02 Subject ${process.pid} ${academicFixtureCounter += 1}`) {
+  const [row] = await database("materia")
+    .insert({ nome: name, descricao: null })
+    .returning("id_materia");
+  return String(row.id_materia);
+}
+
+async function insertSimulation(database, classId, {
+  confirmed = false,
+  cancelled = false,
+  date = "2000-01-01"
+} = {}) {
+  academicFixtureCounter += 1;
+  const [row] = await database("simulado")
+    .insert({
+      id_turma: classId,
+      numero: academicFixtureCounter,
+      tipo: "objetivo",
+      bimestre: 1,
+      data_realizacao: date,
+      instante_confirmacao_realizacao: confirmed ? database.raw("clock_timestamp()") : null,
+      excluido_em: cancelled ? database.raw("clock_timestamp()") : null
+    })
+    .returning("id_simulado");
+  return String(row.id_simulado);
+}
+
+async function insertSimulationSubject(database, simulationId, classId, subjectId) {
+  await database("simulado_disciplina").insert({
+    id_simulado: simulationId,
+    id_turma: classId,
+    id_materia: subjectId,
+    total_questoes: 1,
+    peso: "1"
+  });
+}
+
 function accountRequest(method, {
   origin = AUTH_ORIGIN,
   requestedWith = "XMLHttpRequest",
@@ -274,7 +342,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       extension: "js"
     });
     assert.equal(batch, 1);
-    assert.equal(migrations.length, 4);
+    assert.equal(migrations.length, 5);
 
     await t.test("admin login creates hash-only session, rotates it on login, and logout revokes it", async () => {
       const account = await insertAuthAdministrator(database);
@@ -1885,6 +1953,867 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       }), context);
       assert.equal(nonAdminResponse.status, 404);
       assert.equal(messages.length, 2);
+    });
+
+    await t.test("administrative subject CRUD preserves contracts, uniqueness, authorization, and sanitized events", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("subject-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const handlers = adminSubjectHandlers(database);
+      const logMessages = [];
+      const context = { invocationId: "synthetic-subject-invocation", log(message) { logMessages.push(message); } };
+      const prefix = `SubjectCRUD${process.pid}`;
+      const originalName = `${prefix} Matemática`;
+
+      const created = await handlers.createSubject(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: `  ${originalName}  `, description: "Descrição inicial" }
+      }), context);
+      assert.equal(created.status, 201);
+      assert.match(String(created.jsonBody.subjectId), /^[1-9]\d*$/);
+      assert.deepEqual(created.jsonBody, {
+        subjectId: created.jsonBody.subjectId,
+        name: originalName,
+        description: "Descrição inicial"
+      });
+      const subjectId = created.jsonBody.subjectId;
+      assert.equal((await database("materia").where({ id_materia: subjectId }).first()).nome, originalName);
+
+      const second = await handlers.createSubject(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: `${prefix} Beta` }
+      }), context);
+      const third = await handlers.createSubject(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: `${prefix} Alpha`, description: "Descrição opcional" }
+      }), context);
+      assert.equal(second.status, 201);
+      assert.equal(second.jsonBody.description, null);
+      assert.equal(third.status, 201);
+
+      const firstPage = await handlers.listSubjects(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams(`search=${encodeURIComponent(prefix.toLowerCase())}&page=1&pageSize=2`)
+      }), context);
+      assert.equal(firstPage.status, 200);
+      assert.deepEqual(firstPage.jsonBody.pagination, { page: 1, pageSize: 2, totalItems: 3, totalPages: 2 });
+      assert.deepEqual(firstPage.jsonBody.items.map((item) => item.name), [
+        `${prefix} Alpha`, `${prefix} Beta`
+      ]);
+      const secondPage = await handlers.listSubjects(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams(`search=${encodeURIComponent(prefix)}&page=2&pageSize=2`)
+      }), context);
+      assert.equal(secondPage.jsonBody.items.length, 1);
+
+      const renamed = `${prefix} Ciências`;
+      const updateName = await handlers.updateSubject(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { subjectId },
+        body: { name: ` ${renamed} ` }
+      }), context);
+      assert.equal(updateName.status, 200);
+      assert.deepEqual(updateName.jsonBody, {
+        subjectId,
+        name: renamed,
+        description: "Descrição inicial"
+      });
+      const clearDescription = await handlers.updateSubject(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { subjectId },
+        body: { description: null }
+      }), context);
+      assert.equal(clearDescription.status, 200);
+      assert.equal(clearDescription.jsonBody.name, renamed);
+      assert.equal(clearDescription.jsonBody.description, null);
+
+      const duplicateCreate = await handlers.createSubject(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: ` ${renamed.toLocaleLowerCase("pt-BR")} ` }
+      }), context);
+      assertProblemResponse(duplicateCreate, 409, "SUBJECT_ALREADY_EXISTS");
+      const duplicateUpdate = await handlers.updateSubject(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { subjectId: second.jsonBody.subjectId },
+        body: { name: renamed }
+      }), context);
+      assertProblemResponse(duplicateUpdate, 409, "SUBJECT_ALREADY_EXISTS");
+      const unchangedDuplicateTarget = await database("materia")
+        .where({ id_materia: second.jsonBody.subjectId }).first("nome");
+      assert.equal(unchangedDuplicateTarget.nome, `${prefix} Beta`);
+
+      const classId = (await database("turma")
+        .insert({ serie: 1, ano_letivo: 2500 + (process.pid % 1000) })
+        .returning("id_turma"))[0].id_turma;
+      await database("turma_disciplina").insert({
+        id_turma: classId,
+        id_materia: second.jsonBody.subjectId
+      });
+      const linkedDelete = await handlers.deleteSubject(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { subjectId: second.jsonBody.subjectId }
+      }), context);
+      assertProblemResponse(linkedDelete, 409, "SUBJECT_HAS_CLASS_LINKS");
+      assert.equal((await database("materia").where({ id_materia: second.jsonBody.subjectId }).first()).excluido_em, null);
+
+      const missingDelete = await handlers.deleteSubject(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { subjectId: "9223372036854775807" }
+      }), context);
+      assertProblemResponse(missingDelete, 404, "SUBJECT_NOT_FOUND");
+      const deleted = await handlers.deleteSubject(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { subjectId }
+      }), context);
+      assert.equal(deleted.status, 204);
+      assert.ok((await database("materia").where({ id_materia: subjectId }).first()).excluido_em);
+      const repeatedDelete = await handlers.deleteSubject(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { subjectId }
+      }), context);
+      assert.equal(repeatedDelete.status, 204);
+      const reusedName = await handlers.createSubject(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: renamed }
+      }), context);
+      assert.equal(reusedName.status, 201);
+      assert.notEqual(reusedName.jsonBody.subjectId, subjectId);
+      const activeAfterReuse = await handlers.listSubjects(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams(`search=${encodeURIComponent(renamed)}`)
+      }), context);
+      assert.deepEqual(activeAfterReuse.jsonBody.items.map((item) => item.subjectId), [reusedName.jsonBody.subjectId]);
+
+      const missingUpdate = await handlers.updateSubject(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { subjectId: "9223372036854775807" },
+        body: { description: null }
+      }), context);
+      assertProblemResponse(missingUpdate, 404, "SUBJECT_NOT_FOUND");
+
+      const concurrentName = `${prefix} Concurrent`;
+      const secondHandlers = adminSubjectHandlers(secondConnection);
+      const concurrent = await Promise.all([
+        handlers.createSubject(accountRequest("POST", {
+          cookie: adminToken, body: { name: concurrentName }
+        }), context),
+        secondHandlers.createSubject(accountRequest("POST", {
+          cookie: adminToken, body: { name: concurrentName }
+        }), context)
+      ]);
+      assert.equal(concurrent.filter((response) => response.status === 201).length, 1);
+      assert.equal(concurrent.filter((response) => response.status === 409).length, 1);
+      assert.equal(concurrent.find((response) => response.status === 409).jsonBody.code, "SUBJECT_ALREADY_EXISTS");
+
+      const studentId = await insertStudent(database, newIdentity("subject-non-admin"));
+      const studentToken = await insertAuthSession(database, studentId);
+      const queries = [];
+      const queryListener = (query) => queries.push(query.sql);
+      database.on("query", queryListener);
+      try {
+        const denied = await Promise.all([
+          handlers.listSubjects(accountRequest("GET", {
+            cookie: studentToken, query: new URLSearchParams()
+          }), context),
+          handlers.createSubject(accountRequest("POST", {
+            cookie: studentToken, body: { name: `${prefix} denied` }
+          }), context),
+          handlers.updateSubject(accountRequest("PATCH", {
+            cookie: studentToken,
+            params: { subjectId: reusedName.jsonBody.subjectId },
+            body: { name: `${prefix} denied update` }
+          }), context),
+          handlers.deleteSubject(accountRequest("DELETE", {
+            cookie: studentToken, params: { subjectId: reusedName.jsonBody.subjectId }
+          }), context)
+        ]);
+        for (const response of denied) assertProblemResponse(response, 404, "RESOURCE_NOT_FOUND");
+      } finally {
+        database.removeListener("query", queryListener);
+      }
+      assert.ok(queries.length >= 4);
+      assert.equal(queries.some((sql) => /\b(?:FROM|JOIN|INTO|UPDATE|DELETE\s+FROM)\s+"?materia\b/i.test(sql)), false);
+      assert.equal(queries.some((sql) => /\b(?:FROM|JOIN|INTO|UPDATE|DELETE\s+FROM)\s+"?turma_disciplina\b/i.test(sql)), false);
+
+      const records = logMessages.map((line) => JSON.parse(line));
+      assert.ok(records.some((record) => record.event === "admin_subject_create" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_subject_update" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_subject_delete" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_subject_delete" && record.result === "rejected"));
+      for (const record of records) {
+        assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
+      }
+      const serializedLogs = JSON.stringify(records);
+      for (const sensitiveValue of [prefix, "Descrição inicial", "Descrição opcional", concurrentName]) {
+        assert.equal(serializedLogs.includes(sensitiveValue), false);
+      }
+    });
+
+    await t.test("administrative classes enforce active uniqueness, link rules, and current-year queries", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("class-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const handlers = adminClassHandlers(database);
+      const classLogs = [];
+      const context = {
+        invocationId: "synthetic-class-invocation",
+        log(message) { classLogs.push(message); }
+      };
+      const currentYear = new Date().getUTCFullYear();
+
+      const first = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken, body: { series: 2, schoolYear: currentYear }
+      }), context);
+      const second = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken, body: { series: 3, schoolYear: currentYear }
+      }), context);
+      const older = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken, body: { series: 1, schoolYear: currentYear - 1 }
+      }), context);
+      for (const response of [first, second, older]) assert.equal(response.status, 201);
+      assert.deepEqual(Object.keys(first.jsonBody).sort(), ["classId", "schoolYear", "series"]);
+      assert.equal(first.jsonBody.series, 2);
+      assert.equal(first.jsonBody.schoolYear, currentYear);
+
+      const duplicate = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken, body: { series: 2, schoolYear: currentYear }
+      }), context);
+      assertProblemResponse(duplicate, 409, "CLASS_ALREADY_EXISTS");
+
+      const defaultPage = await handlers.listClasses(accountRequest("GET", {
+        cookie: adminToken, query: new URLSearchParams()
+      }), context);
+      assert.equal(defaultPage.status, 200);
+      assert.deepEqual(defaultPage.jsonBody.pagination, {
+        page: 1, pageSize: 20, totalItems: 2, totalPages: 1
+      });
+      assert.ok(defaultPage.jsonBody.items.every((item) => item.schoolYear === currentYear));
+      assert.deepEqual(defaultPage.jsonBody.items.map((item) => item.series), [2, 3]);
+      const filteredPage = await handlers.listClasses(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams(`schoolYear=${currentYear - 1}&page=1&pageSize=1`)
+      }), context);
+      assert.deepEqual(filteredPage.jsonBody.pagination, {
+        page: 1, pageSize: 1, totalItems: 1, totalPages: 1
+      });
+      assert.deepEqual(filteredPage.jsonBody.items, [older.jsonBody]);
+
+      const detail = await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: first.jsonBody.classId }
+      }), context);
+      assert.deepEqual(detail.jsonBody, first.jsonBody);
+      const missingDetail = await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: "9223372036854775807" }
+      }), context);
+      assertProblemResponse(missingDetail, 404, "CLASS_NOT_FOUND");
+
+      const duplicateUpdate = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { classId: second.jsonBody.classId },
+        body: { series: 2 }
+      }), context);
+      assertProblemResponse(duplicateUpdate, 409, "CLASS_ALREADY_EXISTS");
+
+      const updated = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { classId: first.jsonBody.classId },
+        body: { series: 1 }
+      }), context);
+      assert.equal(updated.status, 200);
+      assert.deepEqual(updated.jsonBody, {
+        classId: first.jsonBody.classId, series: 1, schoolYear: currentYear
+      });
+      assert.equal((await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: first.jsonBody.classId }
+      }), context)).status, 204);
+
+      const concurrentYear = nextSchoolYear();
+      const concurrentClassCreates = await Promise.all([
+        handlers.createClass(accountRequest("POST", {
+          cookie: adminToken, body: { series: 1, schoolYear: concurrentYear }
+        }), context),
+        adminClassHandlers(secondConnection).createClass(accountRequest("POST", {
+          cookie: adminToken, body: { series: 1, schoolYear: concurrentYear }
+        }), context)
+      ]);
+      assert.equal(concurrentClassCreates.filter((response) => response.status === 201).length, 1);
+      assert.equal(concurrentClassCreates.filter((response) => response.status === 409).length, 1);
+      assert.equal(concurrentClassCreates.find((response) => response.status === 409).jsonBody.code, "CLASS_ALREADY_EXISTS");
+
+      const linkedClassId = await insertClass(database);
+      const linkedSubjectId = await insertSubject(database);
+      const [linkedOffer] = await database("turma_disciplina")
+        .insert({ id_turma: linkedClassId, id_materia: linkedSubjectId })
+        .returning("id_turma_disciplina");
+      const linkedDelete = await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: linkedClassId }
+      }), context);
+      assertProblemResponse(linkedDelete, 409, "CLASS_HAS_LINKED_DATA");
+      const linkedEdit = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken, params: { classId: linkedClassId }, body: { schoolYear: nextSchoolYear() }
+      }), context);
+      assertProblemResponse(linkedEdit, 409, "CLASS_HAS_LINKED_DATA");
+      await assert.rejects(
+        database("turma").where({ id_turma: linkedClassId }).delete(),
+        (error) => error.constraint === "turma_disciplina_id_turma_fkey"
+      );
+      assert.equal(await database("turma_disciplina").where({ id_turma_disciplina: linkedOffer.id_turma_disciplina }).first() !== undefined, true);
+
+      const activeEnrollmentClass = await insertClass(database);
+      const activeStudentId = await insertStudent(database);
+      await database("matricula").insert({
+        id_usuario_aluno: activeStudentId,
+        id_turma: activeEnrollmentClass,
+        inicio_vigencia: database.raw("CURRENT_DATE"),
+        fim_vigencia: null,
+        cancelada_em: null
+      });
+      const enrollmentBlocked = await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: activeEnrollmentClass }
+      }), context);
+      assertProblemResponse(enrollmentBlocked, 409, "CLASS_HAS_LINKED_DATA");
+      const enrollmentEditBlocked = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken, params: { classId: activeEnrollmentClass }, body: { series: 2 }
+      }), context);
+      assertProblemResponse(enrollmentEditBlocked, 409, "CLASS_HAS_LINKED_DATA");
+      await database("matricula").where({ id_turma: activeEnrollmentClass }).update({
+        cancelada_em: database.raw("clock_timestamp()")
+      });
+      const cancelledEnrollmentEdit = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken, params: { classId: activeEnrollmentClass }, body: { schoolYear: nextSchoolYear() }
+      }), context);
+      assertProblemResponse(cancelledEnrollmentEdit, 409, "CLASS_HAS_LINKED_DATA");
+      const cancelledEnrollmentDelete = await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: activeEnrollmentClass }
+      }), context);
+      assert.equal(cancelledEnrollmentDelete.status, 204);
+
+      const endedEnrollmentClass = await insertClass(database);
+      const endedStudentId = await insertStudent(database);
+      await database("matricula").insert({
+        id_usuario_aluno: endedStudentId,
+        id_turma: endedEnrollmentClass,
+        inicio_vigencia: database.raw("CURRENT_DATE - 30"),
+        fim_vigencia: database.raw("CURRENT_DATE - 1"),
+        cancelada_em: null
+      });
+      const endedEnrollmentEdit = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken, params: { classId: endedEnrollmentClass }, body: { series: 2 }
+      }), context);
+      assertProblemResponse(endedEnrollmentEdit, 409, "CLASS_HAS_LINKED_DATA");
+      const endedEnrollmentDelete = await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: endedEnrollmentClass }
+      }), context);
+      assert.equal(endedEnrollmentDelete.status, 204);
+
+      const activeSimulationClass = await insertClass(database);
+      const activeSimulation = await insertSimulation(database, activeSimulationClass, { date: "1999-01-01" });
+      const activeSimulationDelete = await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: activeSimulationClass }
+      }), context);
+      assertProblemResponse(activeSimulationDelete, 409, "CLASS_HAS_LINKED_DATA");
+      await database("simulado").where({ id_simulado: activeSimulation }).update({
+        excluido_em: database.raw("clock_timestamp()")
+      });
+      const cancelledSimulationEdit = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken, params: { classId: activeSimulationClass }, body: { schoolYear: nextSchoolYear() }
+      }), context);
+      assertProblemResponse(cancelledSimulationEdit, 409, "CLASS_HAS_LINKED_DATA");
+      const cancelledSimulationDelete = await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: activeSimulationClass }
+      }), context);
+      assert.equal(cancelledSimulationDelete.status, 204);
+
+      const confirmedSimulationClass = await insertClass(database);
+      await insertSimulation(database, confirmedSimulationClass, {
+        confirmed: true, date: "2099-12-31"
+      });
+      const confirmedSimulationDelete = await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: confirmedSimulationClass }
+      }), context);
+      assert.equal(confirmedSimulationDelete.status, 204);
+
+      const uniqueSimulationClass = await insertClass(database);
+      const uniqueSimulation = await insertSimulation(database, uniqueSimulationClass, {
+        confirmed: true, date: "2099-12-31"
+      });
+      const confirmedSimulationEdit = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken, params: { classId: uniqueSimulationClass }, body: { schoolYear: nextSchoolYear() }
+      }), context);
+      assertProblemResponse(confirmedSimulationEdit, 409, "CLASS_HAS_LINKED_DATA");
+      assert.equal((await database("simulado").where({ id_simulado: uniqueSimulation }).first()) !== undefined, true);
+
+      const raceClassId = await insertClass(database);
+      const raceSubjectId = await insertSubject(database);
+      const workerApplication = `phase02-class-worker-${process.pid}`;
+      const monitor = makeKnex({
+        ...connectionFromEnvironment(generatedDatabase),
+        application_name: `phase02-class-monitor-${process.pid}`
+      });
+      const worker = makeKnex({ ...targetConnection, application_name: workerApplication });
+      let releaseClassBlocker;
+      let signalClassLocked;
+      const classLocked = new Promise((resolve) => { signalClassLocked = resolve; });
+      const continueClassBlocker = new Promise((resolve) => { releaseClassBlocker = resolve; });
+      const classBlockerTransaction = database.transaction(async (transaction) => {
+        await transaction("turma").where({ id_turma: raceClassId }).forUpdate().first();
+        signalClassLocked();
+        await continueClassBlocker;
+        await transaction("turma_disciplina").insert({
+          id_turma: raceClassId,
+          id_materia: raceSubjectId
+        });
+      });
+      try {
+        await classLocked;
+        const workerHandlers = adminClassHandlers(worker);
+        const pendingClassDelete = workerHandlers.deleteClass(accountRequest("DELETE", {
+          cookie: adminToken, params: { classId: raceClassId }
+        }), context);
+        await waitForLockWait(monitor, workerApplication);
+        releaseClassBlocker();
+        await classBlockerTransaction;
+        assertProblemResponse(await pendingClassDelete, 409, "CLASS_HAS_LINKED_DATA");
+        assert.equal(await database("turma").where({ id_turma: raceClassId }).whereNull("excluido_em").first() !== undefined, true);
+        assert.equal(await database("turma_disciplina").where({
+          id_turma: raceClassId, id_materia: raceSubjectId
+        }).first() !== undefined, true);
+      } finally {
+        releaseClassBlocker();
+        await classBlockerTransaction.catch(() => undefined);
+        await Promise.all([monitor.destroy(), worker.destroy()]);
+      }
+
+      const cancelledOnlyYear = nextSchoolYear();
+      const reusableClass = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken, body: { series: 1, schoolYear: cancelledOnlyYear }
+      }), context);
+      assert.equal(reusableClass.status, 201);
+      assert.equal((await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: reusableClass.jsonBody.classId }
+      }), context)).status, 204);
+      assert.equal((await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: reusableClass.jsonBody.classId }
+      }), context)).status, 204);
+      const deletedDetail = await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: reusableClass.jsonBody.classId }
+      }), context);
+      assertProblemResponse(deletedDetail, 404, "CLASS_NOT_FOUND");
+      const reused = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken, body: { series: 1, schoolYear: cancelledOnlyYear }
+      }), context);
+      assert.equal(reused.status, 201);
+      assert.notEqual(reused.jsonBody.classId, reusableClass.jsonBody.classId);
+      const years = await handlers.listClassYears(accountRequest("GET", { cookie: adminToken }), context);
+      const yearValues = years.jsonBody.items.map((item) => item.schoolYear);
+      assert.equal(yearValues.includes(cancelledOnlyYear), true);
+      assert.equal(yearValues.filter((value) => value === currentYear).length, 1);
+      assert.deepEqual(yearValues, [...yearValues].sort((left, right) => right - left));
+      const removedOnlyYear = nextSchoolYear();
+      const temporaryYearClass = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken, body: { series: 2, schoolYear: removedOnlyYear }
+      }), context);
+      assert.equal(temporaryYearClass.status, 201);
+      assert.equal((await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: temporaryYearClass.jsonBody.classId }
+      }), context)).status, 204);
+      const yearsAfterDelete = await handlers.listClassYears(accountRequest("GET", { cookie: adminToken }), context);
+      assert.equal(yearsAfterDelete.jsonBody.items.some((item) => item.schoolYear === removedOnlyYear), false);
+
+      const studentId = await insertStudent(database, newIdentity("class-non-admin"));
+      const studentToken = await insertAuthSession(database, studentId);
+      const queries = [];
+      const queryListener = (query) => queries.push(query.sql);
+      database.on("query", queryListener);
+      try {
+        const denied = await Promise.all([
+          handlers.listClasses(accountRequest("GET", {
+            cookie: studentToken, query: new URLSearchParams()
+          }), context),
+          handlers.listClassYears(accountRequest("GET", { cookie: studentToken }), context),
+          handlers.getClass(accountRequest("GET", {
+            cookie: studentToken, params: { classId: first.jsonBody.classId }
+          }), context),
+          handlers.createClass(accountRequest("POST", {
+            cookie: studentToken, body: { series: 1, schoolYear: nextSchoolYear() }
+          }), context),
+          handlers.updateClass(accountRequest("PATCH", {
+            cookie: studentToken, params: { classId: first.jsonBody.classId }, body: { series: 2 }
+          }), context),
+          handlers.deleteClass(accountRequest("DELETE", {
+            cookie: studentToken, params: { classId: first.jsonBody.classId }
+          }), context),
+          handlers.listClassSubjects(accountRequest("GET", {
+            cookie: studentToken, params: { classId: linkedClassId }
+          }), context),
+          handlers.addClassSubject(accountRequest("PUT", {
+            cookie: studentToken, params: { classId: linkedClassId, subjectId: linkedSubjectId }
+          }), context),
+          handlers.removeClassSubject(accountRequest("DELETE", {
+            cookie: studentToken, params: { classId: linkedClassId, subjectId: linkedSubjectId }
+          }), context)
+        ]);
+        for (const response of denied) assertProblemResponse(response, 404, "RESOURCE_NOT_FOUND");
+      } finally {
+        database.removeListener("query", queryListener);
+      }
+      assert.equal(queries.some((sql) => /\b(?:FROM|JOIN|INTO|UPDATE|DELETE\s+FROM)\s+"?(?:turma|turma_disciplina|materia|matricula|simulado)\b/i.test(sql)), false);
+      const records = classLogs.map((line) => JSON.parse(line));
+      assert.ok(records.some((record) => record.event === "admin_class_create" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_class_update" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_class_delete" && record.result === "rejected"));
+      assert.ok(records.some((record) => record.event === "admin_class_delete" && record.result === "completed"));
+      for (const record of records) {
+        assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
+      }
+    });
+
+    await t.test("subject offers are idempotent, preserve results, and remove related state atomically", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("offer-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const handlers = adminClassHandlers(database);
+      const accountHandlers = adminAccountHandlers(database, { async send() {} });
+      const logs = [];
+      const context = { invocationId: "synthetic-offer-invocation", log(message) { logs.push(message); } };
+
+      const classId = await insertClass(database);
+      const subjectZ = await insertSubject(database, `Phase02 Offer Z ${process.pid}`);
+      const subjectA = await insertSubject(database, `Phase02 Offer A ${process.pid}`);
+      const empty = await handlers.listClassSubjects(accountRequest("GET", {
+        cookie: adminToken, params: { classId }
+      }), context);
+      assert.equal(empty.status, 200);
+      assert.deepEqual(empty.jsonBody, { items: [] });
+
+      for (const subjectId of [subjectZ, subjectA]) {
+        const added = await handlers.addClassSubject(accountRequest("PUT", {
+          cookie: adminToken, params: { classId, subjectId }
+        }), context);
+        assert.equal(added.status, 204);
+        const repeated = await handlers.addClassSubject(accountRequest("PUT", {
+          cookie: adminToken, params: { classId, subjectId }
+        }), context);
+        assert.equal(repeated.status, 204);
+      }
+      const offered = await handlers.listClassSubjects(accountRequest("GET", {
+        cookie: adminToken, params: { classId }
+      }), context);
+      assert.deepEqual(offered.jsonBody.items.map((item) => item.subjectId), [subjectA, subjectZ]);
+      assert.deepEqual(offered.jsonBody.items.map((item) => item.name), [
+        `Phase02 Offer A ${process.pid}`, `Phase02 Offer Z ${process.pid}`
+      ]);
+
+      const deletedSubject = await insertSubject(database);
+      await database("materia").where({ id_materia: deletedSubject }).update({
+        excluido_em: database.raw("clock_timestamp()")
+      });
+      for (const params of [
+        { classId: "9223372036854775807", subjectId: subjectZ },
+        { classId, subjectId: "9223372036854775807" },
+        { classId, subjectId: deletedSubject }
+      ]) {
+        const incompatible = await handlers.addClassSubject(accountRequest("PUT", {
+          cookie: adminToken, params
+        }), context);
+        assertProblemResponse(incompatible, 404, "RESOURCE_NOT_FOUND");
+      }
+      const deletedClassId = await insertClass(database);
+      const deletedClassResponse = await handlers.deleteClass(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: deletedClassId }
+      }), context);
+      assert.equal(deletedClassResponse.status, 204);
+      assertProblemResponse(await handlers.listClassSubjects(accountRequest("GET", {
+        cookie: adminToken, params: { classId: deletedClassId }
+      }), context), 404, "RESOURCE_NOT_FOUND");
+      assertProblemResponse(await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: deletedClassId, subjectId: subjectZ }
+      }), context), 404, "RESOURCE_NOT_FOUND");
+      assertProblemResponse(await handlers.listClassSubjects(accountRequest("GET", {
+        cookie: adminToken, params: { classId: "9223372036854775807" }
+      }), context), 404, "RESOURCE_NOT_FOUND");
+      assertProblemResponse(await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: deletedClassId, subjectId: subjectZ }
+      }), context), 404, "RESOURCE_NOT_FOUND");
+      assertProblemResponse(await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId, subjectId: "9223372036854775807" }
+      }), context), 404, "RESOURCE_NOT_FOUND");
+      assert.equal((await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId, subjectId: deletedSubject }
+      }), context)).status, 404);
+
+      const missingOfferDelete = await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId, subjectId: deletedSubject }
+      }), context);
+      assertProblemResponse(missingOfferDelete, 404, "RESOURCE_NOT_FOUND");
+      const absentValidOfferDelete = await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId, subjectId: await insertSubject(database) }
+      }), context);
+      assert.equal(absentValidOfferDelete.status, 204);
+
+      const activeClass = await insertClass(database);
+      const activeSubject = await insertSubject(database);
+      assert.equal((await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: activeClass, subjectId: activeSubject }
+      }), context)).status, 204);
+      const [activeOffer] = await database("turma_disciplina")
+        .where({ id_turma: activeClass, id_materia: activeSubject }).select("id_turma_disciplina");
+      const teacherId = await insertProfessor(database);
+      await database("turma_disciplina_professor").insert({
+        id_turma_disciplina: activeOffer.id_turma_disciplina,
+        id_usuario_professor: teacherId
+      });
+      const unconfirmed = await insertSimulation(database, activeClass, { date: "1999-01-01" });
+      await insertSimulationSubject(database, unconfirmed, activeClass, activeSubject);
+      const removed = await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: activeClass, subjectId: activeSubject }
+      }), context);
+      assert.equal(removed.status, 204);
+      assert.equal(await database("turma_disciplina").where({ id_turma: activeClass, id_materia: activeSubject }).first(), undefined);
+      assert.equal(await database("simulado_disciplina").where({ id_simulado: unconfirmed }).first(), undefined);
+      assert.equal(await database("turma_disciplina_professor").where({
+        id_turma_disciplina: activeOffer.id_turma_disciplina
+      }).first(), undefined);
+      assert.equal(await database("professor").where({ id_usuario: teacherId }).first() !== undefined, true);
+      assert.equal(await database("simulado").where({ id_simulado: unconfirmed }).first() !== undefined, true);
+      assert.equal((await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: activeClass, subjectId: activeSubject }
+      }), context)).status, 204);
+      const [readdedOffer] = await database("turma_disciplina")
+        .where({ id_turma: activeClass, id_materia: activeSubject }).select("id_turma_disciplina");
+      assert.equal(await database("turma_disciplina_professor").where({
+        id_turma_disciplina: readdedOffer.id_turma_disciplina,
+        id_usuario_professor: teacherId
+      }).first(), undefined);
+      assert.equal((await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: activeClass, subjectId: activeSubject }
+      }), context)).status, 204);
+      assert.equal((await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: activeClass, subjectId: activeSubject }
+      }), context)).status, 204);
+
+      const cancelledClass = await insertClass(database);
+      const cancelledSubject = await insertSubject(database);
+      await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: cancelledClass, subjectId: cancelledSubject }
+      }), context);
+      const cancelledSimulation = await insertSimulation(database, cancelledClass, { cancelled: true });
+      await insertSimulationSubject(database, cancelledSimulation, cancelledClass, cancelledSubject);
+      assert.equal((await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: cancelledClass, subjectId: cancelledSubject }
+      }), context)).status, 204);
+      assert.equal(await database("simulado").where({ id_simulado: cancelledSimulation }).first() !== undefined, true);
+      assert.equal(await database("simulado_disciplina").where({ id_simulado: cancelledSimulation }).first(), undefined);
+
+      const completedClass = await insertClass(database);
+      const completedSubject = await insertSubject(database);
+      await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: completedClass, subjectId: completedSubject }
+      }), context);
+      const completedSimulation = await insertSimulation(database, completedClass, {
+        confirmed: true, cancelled: true, date: "2099-12-31"
+      });
+      await insertSimulationSubject(database, completedSimulation, completedClass, completedSubject);
+      const completedBlocked = await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: completedClass, subjectId: completedSubject }
+      }), context);
+      assertProblemResponse(completedBlocked, 409, "SUBJECT_HAS_COMPLETED_SIMULATIONS");
+      assert.equal(await database("turma_disciplina").where({
+        id_turma: completedClass, id_materia: completedSubject
+      }).first() !== undefined, true);
+      assert.equal(await database("simulado_disciplina").where({ id_simulado: completedSimulation }).first() !== undefined, true);
+
+      const resultClass = await insertClass(database);
+      const resultSubject = await insertSubject(database);
+      await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: resultClass, subjectId: resultSubject }
+      }), context);
+      const resultSimulation = await insertSimulation(database, resultClass, { date: "1999-01-01" });
+      await insertSimulationSubject(database, resultSimulation, resultClass, resultSubject);
+      const resultStudentId = await insertStudent(database);
+      await database("simulado_aluno").insert({
+        id_simulado: resultSimulation,
+        id_usuario_aluno: resultStudentId
+      });
+      await database("resultado").insert({
+        id_simulado: resultSimulation,
+        id_usuario_aluno: resultStudentId,
+        id_turma: resultClass,
+        id_materia: resultSubject,
+        estado: "pendente",
+        acertos: null
+      });
+      const resultBlocked = await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: resultClass, subjectId: resultSubject }
+      }), context);
+      assertProblemResponse(resultBlocked, 409, "SUBJECT_HAS_SIMULATION_RESULTS");
+      assert.equal(await database("resultado").where({ id_simulado: resultSimulation }).first() !== undefined, true);
+      assert.equal(await database("simulado_disciplina").where({ id_simulado: resultSimulation }).first() !== undefined, true);
+      assert.equal(await database("turma_disciplina").where({
+        id_turma: resultClass, id_materia: resultSubject
+      }).first() !== undefined, true);
+
+      const rollbackClass = await insertClass(database);
+      const rollbackSubject = await insertSubject(database);
+      await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: rollbackClass, subjectId: rollbackSubject }
+      }), context);
+      const rollbackOffer = await database("turma_disciplina")
+        .where({ id_turma: rollbackClass, id_materia: rollbackSubject }).first("id_turma_disciplina");
+      const rollbackTeacher = await insertProfessor(database);
+      await database("turma_disciplina_professor").insert({
+        id_turma_disciplina: rollbackOffer.id_turma_disciplina,
+        id_usuario_professor: rollbackTeacher
+      });
+      const rollbackSimulation = await insertSimulation(database, rollbackClass);
+      await insertSimulationSubject(database, rollbackSimulation, rollbackClass, rollbackSubject);
+      await database.raw(`
+        CREATE FUNCTION phase02_fail_offer_delete() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'synthetic phase02 private failure';
+        END;
+        $$;
+        CREATE TRIGGER phase02_fail_offer_delete_trg
+          BEFORE DELETE ON turma_disciplina
+          FOR EACH ROW EXECUTE FUNCTION phase02_fail_offer_delete();
+      `);
+      let rollbackResponse;
+      try {
+        rollbackResponse = await handlers.removeClassSubject(accountRequest("DELETE", {
+          cookie: adminToken, params: { classId: rollbackClass, subjectId: rollbackSubject }
+        }), context);
+      } finally {
+        await database.raw("DROP TRIGGER phase02_fail_offer_delete_trg ON turma_disciplina");
+        await database.raw("DROP FUNCTION phase02_fail_offer_delete()");
+      }
+      assertProblemResponse(rollbackResponse, 500, undefined);
+      assert.equal(JSON.stringify(rollbackResponse).includes("synthetic phase02 private failure"), false);
+      assert.equal(await database("turma_disciplina").where({
+        id_turma: rollbackClass, id_materia: rollbackSubject
+      }).first() !== undefined, true);
+      assert.equal(await database("simulado_disciplina").where({ id_simulado: rollbackSimulation }).first() !== undefined, true);
+      assert.equal(await database("turma_disciplina_professor").where({
+        id_turma_disciplina: rollbackOffer.id_turma_disciplina,
+        id_usuario_professor: rollbackTeacher
+      }).first() !== undefined, true);
+
+      const raceClass = await insertClass(database);
+      const raceSubject = await insertSubject(database);
+      await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: raceClass, subjectId: raceSubject }
+      }), context);
+      const raceSimulation = await insertSimulation(database, raceClass);
+      await insertSimulationSubject(database, raceSimulation, raceClass, raceSubject);
+      const raceStudentId = await insertStudent(database);
+      await database("simulado_aluno").insert({ id_simulado: raceSimulation, id_usuario_aluno: raceStudentId });
+      const workerApplication = `phase02-offer-worker-${process.pid}`;
+      const blocker = makeKnex({
+        ...connectionFromEnvironment(generatedDatabase),
+        application_name: `phase02-offer-blocker-${process.pid}`
+      });
+      const worker = makeKnex({ ...targetConnection, application_name: workerApplication });
+      let releaseBlocker;
+      let signalLocked;
+      const locked = new Promise((resolve) => { signalLocked = resolve; });
+      const continueBlocker = new Promise((resolve) => { releaseBlocker = resolve; });
+      const blockerTransaction = database.transaction(async (transaction) => {
+        await transaction("simulado").where({ id_simulado: raceSimulation }).forUpdate().first();
+        await transaction("simulado_disciplina")
+          .where({ id_simulado: raceSimulation, id_turma: raceClass, id_materia: raceSubject })
+          .forUpdate()
+          .first();
+        signalLocked();
+        await continueBlocker;
+        await transaction("resultado").insert({
+          id_simulado: raceSimulation,
+          id_usuario_aluno: raceStudentId,
+          id_turma: raceClass,
+          id_materia: raceSubject,
+          estado: "pendente",
+          acertos: null
+        });
+      });
+      try {
+        await locked;
+        const workerHandlers = adminClassHandlers(worker);
+        const pendingRemoval = workerHandlers.removeClassSubject(accountRequest("DELETE", {
+          cookie: adminToken, params: { classId: raceClass, subjectId: raceSubject }
+        }), context);
+        await waitForLockWait(blocker, workerApplication);
+        releaseBlocker();
+        await blockerTransaction;
+        const racedRemoval = await pendingRemoval;
+        assertProblemResponse(racedRemoval, 409, "SUBJECT_HAS_SIMULATION_RESULTS");
+        assert.equal(await database("resultado").where({ id_simulado: raceSimulation }).first() !== undefined, true);
+        assert.equal(await database("turma_disciplina").where({
+          id_turma: raceClass, id_materia: raceSubject
+        }).first() !== undefined, true);
+      } finally {
+        releaseBlocker();
+        await blockerTransaction.catch(() => undefined);
+        await Promise.all([blocker.destroy(), worker.destroy()]);
+      }
+
+      const records = logs.map((line) => JSON.parse(line));
+      assert.ok(records.some((record) => record.event === "admin_class_subject_add" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_class_subject_remove" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_class_subject_remove" && record.result === "failed"));
+      assert.ok(records.some((record) => record.event === "admin_class_subject_remove" && record.result === "rejected"));
+      for (const record of records) {
+        assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
+      }
+      assert.equal(JSON.stringify(records).includes("synthetic phase02 private failure"), false);
+      assert.equal(JSON.stringify(records).includes(`Phase02 Offer ${process.pid}`), false);
+      assert.equal((await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: activeClass, subjectId: activeSubject }
+      }), context)).status, 204);
+      const [teacherOffer] = await database("turma_disciplina")
+        .where({ id_turma: activeClass, id_materia: activeSubject }).select("id_turma_disciplina");
+      assert.equal((await accountHandlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken,
+        params: { classId: activeClass, subjectId: activeSubject, teacherId }
+      }), context)).status, 204);
+      assert.equal((await handlers.removeClassSubject(accountRequest("DELETE", {
+        cookie: adminToken, params: { classId: activeClass, subjectId: activeSubject }
+      }), context)).status, 204);
+      assert.equal(await database("turma_disciplina_professor").where({
+        id_turma_disciplina: teacherOffer.id_turma_disciplina
+      }).first(), undefined);
+      assert.equal(await database("professor").where({ id_usuario: teacherId }).first() !== undefined, true);
+    });
+
+    await t.test("phase 02 migration is additive, forward-only, and applies to the initial schema", async () => {
+      const columns = await database.raw(`
+        SELECT column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'turma'
+          AND column_name = 'excluido_em'
+      `);
+      assert.deepEqual(columns.rows, [{
+        column_name: "excluido_em",
+        data_type: "timestamp with time zone",
+        is_nullable: "YES",
+        column_default: null
+      }]);
+
+      const legacyConstraint = await database.raw(`
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'turma'::regclass
+          AND conname = 'turma_serie_ano_uk'
+      `);
+      assert.equal(legacyConstraint.rows.length, 0);
+      const activeIndex = await database.raw(`
+        SELECT index_row.indisunique,
+               pg_get_expr(index_row.indpred, index_row.indrelid) AS predicate,
+               pg_get_indexdef(index_row.indexrelid) AS definition
+        FROM pg_index AS index_row
+        JOIN pg_class AS index_name ON index_name.oid = index_row.indexrelid
+        WHERE index_name.relname = 'turma_serie_ano_ativa_uk'
+      `);
+      assert.equal(activeIndex.rows.length, 1);
+      assert.equal(activeIndex.rows[0].indisunique, true);
+      assert.match(activeIndex.rows[0].predicate, /excluido_em IS NULL/i);
+      assert.match(activeIndex.rows[0].definition, /\(serie, ano_letivo\)/);
     });
 
     await t.test("creates precisely the 16 approved domain tables", async () => {

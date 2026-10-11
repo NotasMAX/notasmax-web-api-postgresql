@@ -11,11 +11,42 @@ type AssociationResult = { status: "ok" } | { status: "not-found" };
 
 async function activeOfferId(knex: Knex, classId: string, subjectId: string) {
   const offer = await knex("turma_disciplina as td")
+    .join("turma as t", "t.id_turma", "td.id_turma")
     .join("materia as m", "m.id_materia", "td.id_materia")
     .select("td.id_turma_disciplina")
     .where("td.id_turma", classId)
     .where("td.id_materia", subjectId)
+    .whereNull("t.excluido_em")
     .whereNull("m.excluido_em")
+    .first() as { id_turma_disciplina: string | number } | undefined;
+  return offer ? String(offer.id_turma_disciplina) : undefined;
+}
+
+async function lockActiveOfferId(
+  transaction: Knex.Transaction,
+  classId: string,
+  subjectId: string
+): Promise<string | undefined> {
+  const schoolClass = await transaction("turma")
+    .select("id_turma")
+    .where({ id_turma: classId })
+    .whereNull("excluido_em")
+    .forUpdate()
+    .first();
+  if (!schoolClass) return undefined;
+
+  const subject = await transaction("materia")
+    .select("id_materia")
+    .where({ id_materia: subjectId })
+    .whereNull("excluido_em")
+    .forUpdate()
+    .first();
+  if (!subject) return undefined;
+
+  const offer = await transaction("turma_disciplina")
+    .select("id_turma_disciplina")
+    .where({ id_turma: classId, id_materia: subjectId })
+    .forUpdate()
     .first() as { id_turma_disciplina: string | number } | undefined;
   return offer ? String(offer.id_turma_disciplina) : undefined;
 }
@@ -77,11 +108,10 @@ export async function addCurrentTeacher(
   teacherId: string
 ): Promise<AssociationResult> {
   return knex.transaction(async (transaction) => {
-    // This shared lock order serializes association changes with logical teacher deletion.
-    if (!await lockActiveTeacher(transaction, teacherId)) return { status: "not-found" };
-
-    const offerId = await activeOfferId(transaction, classId, subjectId);
+    const offerId = await lockActiveOfferId(transaction, classId, subjectId);
     if (!offerId) return { status: "not-found" };
+    // Lock order serializes offer changes before validating the active teacher row.
+    if (!await lockActiveTeacher(transaction, teacherId)) return { status: "not-found" };
 
     await transaction("turma_disciplina_professor")
       .insert({ id_turma_disciplina: offerId, id_usuario_professor: teacherId })
@@ -98,14 +128,22 @@ export async function removeCurrentTeacher(
   teacherId: string
 ): Promise<AssociationResult> {
   return knex.transaction(async (transaction) => {
-    if (!await lockActiveTeacher(transaction, teacherId)) return { status: "not-found" };
-
-    const offerId = await activeOfferId(transaction, classId, subjectId);
+    const offerId = await lockActiveOfferId(transaction, classId, subjectId);
     if (!offerId) return { status: "not-found" };
+    if (!await lockActiveTeacher(transaction, teacherId)) return { status: "not-found" };
 
     await transaction("turma_disciplina_professor")
       .where({ id_turma_disciplina: offerId, id_usuario_professor: teacherId })
       .delete();
     return { status: "ok" };
   });
+}
+
+export async function removeCurrentTeachersForOffer(
+  transaction: Knex.Transaction,
+  offerId: string
+): Promise<void> {
+  await transaction("turma_disciplina_professor")
+    .where({ id_turma_disciplina: offerId })
+    .delete();
 }
