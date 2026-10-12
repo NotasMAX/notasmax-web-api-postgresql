@@ -1,4 +1,7 @@
 import type { Knex } from "knex";
+import { effectiveEnrollmentPredicate } from "./effective-enrollment";
+import type { MutationActor } from "./admin-class-service";
+import { AdminSessionRevokedError, lockAdminMutationSessions } from "./session-service";
 
 export type AccountProfile = "aluno" | "professor" | "administrador";
 
@@ -51,18 +54,20 @@ function filteredAccounts(knex: Knex, profile: AccountProfile, filters: AccountL
       query.whereExists(function activeEnrollment() {
         this.select(knex.raw("1"))
           .from("matricula as m")
+          .join("turma as t", "t.id_turma", "m.id_turma")
           .whereRaw("m.id_usuario_aluno = u.id_usuario")
-          .whereNull("m.fim_vigencia")
-          .whereNull("m.cancelada_em");
+          .whereNull("t.fechada_em")
+          .whereRaw(effectiveEnrollmentPredicate("m"));
         if (filters.classId) this.where("m.id_turma", filters.classId);
       });
     } else if (filters.enrollmentStatus === "no_active_enrollment") {
       query.whereNotExists(function activeEnrollment() {
         this.select(knex.raw("1"))
           .from("matricula as m")
+          .join("turma as t", "t.id_turma", "m.id_turma")
           .whereRaw("m.id_usuario_aluno = u.id_usuario")
-          .whereNull("m.fim_vigencia")
-          .whereNull("m.cancelada_em");
+          .whereNull("t.fechada_em")
+          .whereRaw(effectiveEnrollmentPredicate("m"));
       });
     }
   }
@@ -72,7 +77,9 @@ function filteredAccounts(knex: Knex, profile: AccountProfile, filters: AccountL
       this.select(knex.raw("1"))
         .from("turma_disciplina_professor as tdp")
         .join("turma_disciplina as td", "td.id_turma_disciplina", "tdp.id_turma_disciplina")
+        .join("turma as t", "t.id_turma", "td.id_turma")
         .whereRaw("tdp.id_usuario_professor = u.id_usuario");
+      this.whereNull("t.fechada_em");
       if (filters.classId) this.where("td.id_turma", filters.classId);
       if (filters.subjectId) this.where("td.id_materia", filters.subjectId);
     });
@@ -129,8 +136,12 @@ export async function listAccounts(
     query
       .leftJoin("matricula as m", function activeEnrollment() {
         this.on("m.id_usuario_aluno", "u.id_usuario")
-          .andOnNull("m.fim_vigencia")
-          .andOnNull("m.cancelada_em");
+          .andOn(knex.raw(effectiveEnrollmentPredicate("m")))
+          .andOn(knex.raw(`EXISTS (
+            SELECT 1 FROM turma AS current_turma
+            WHERE current_turma.id_turma = m.id_turma
+              AND current_turma.fechada_em IS NULL
+          )`));
       })
       .leftJoin("turma as t", "t.id_turma", "m.id_turma")
       .select("m.id_matricula", "t.serie as class_series", "t.ano_letivo as school_year");
@@ -187,12 +198,18 @@ export async function accountDetail(
 
   const enrollments = await knex("matricula as m")
     .join("turma as t", "t.id_turma", "m.id_turma")
-    .select("m.id_matricula", "m.inicio_vigencia", "m.fim_vigencia", "m.cancelada_em", "t.serie", "t.ano_letivo")
+    .select(
+      "m.id_matricula",
+      knex.raw("m.inicio_vigencia::text AS inicio_vigencia"),
+      knex.raw("m.fim_vigencia::text AS fim_vigencia"),
+      "t.serie",
+      "t.ano_letivo",
+      knex.raw(`(${effectiveEnrollmentPredicate("m")} AND t.fechada_em IS NULL) AS is_effective`)
+    )
     .where("m.id_usuario_aluno", userId)
     .orderBy("m.inicio_vigencia", "desc")
     .orderBy("m.id_matricula", "desc") as Array<Record<string, unknown>>;
-  const active = enrollments.find((enrollment) => enrollment.fim_vigencia === null
-    && enrollment.cancelada_em === null);
+  const active = enrollments.find((enrollment) => enrollment.is_effective === true);
 
   return {
     studentId: String(row.id_usuario),
@@ -207,7 +224,7 @@ export async function accountDetail(
       enrollmentId: String(enrollment.id_matricula),
       class: { series: Number(enrollment.serie), schoolYear: Number(enrollment.ano_letivo) },
       startDate: enrollment.inicio_vigencia,
-      cancellationDate: enrollment.cancelada_em
+      cancellationDate: enrollment.fim_vigencia
     }))
   };
 }
@@ -215,9 +232,15 @@ export async function accountDetail(
 export async function createAccount(
   knex: Knex,
   profile: AccountProfile,
-  input: NewAccount
+  input: NewAccount,
+  actor?: MutationActor
 ): Promise<string> {
   return knex.transaction(async (transaction) => {
+    if (actor) {
+      await transaction("usuario").select("id_usuario").where({ id_usuario: actor.actorId }).forUpdate().first();
+      const session = await lockAdminMutationSessions(transaction, actor.token, actor.actorId);
+      if (!session.authorized) throw new AdminSessionRevokedError();
+    }
     const [created] = await transaction("usuario")
       .insert({
         tipo_perfil: profile,
@@ -240,7 +263,6 @@ export async function createAccount(
     return String(id);
   });
 }
-
 export type AccountUpdateResult =
   | { status: "updated"; previousEmail?: string }
   | { status: "not-found" }
@@ -251,7 +273,8 @@ export async function updateAccount(
   profile: AccountProfile,
   userId: string,
   expectedEmail: string,
-  input: AccountPatch
+  input: AccountPatch,
+  actor?: MutationActor
 ): Promise<AccountUpdateResult> {
   const emailChanged = input.email !== undefined && input.email !== expectedEmail;
   return knex.transaction(async (transaction) => {
@@ -259,14 +282,27 @@ export async function updateAccount(
       await transaction.raw("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", [ADMIN_MEMBERSHIP_LOCK]);
     }
 
+    const identityIds = [...new Set([userId, ...(actor ? [actor.actorId] : [])])]
+      .sort((left, right) => BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0);
+    for (const id of identityIds) {
+      await transaction("usuario").select("id_usuario").where({ id_usuario: id }).forUpdate().first();
+    }
     const account = await transaction("usuario")
       .select("id_usuario", "email_institucional")
       .where({ id_usuario: userId, tipo_perfil: profile })
       .whereNull("excluido_em")
-      .forUpdate()
       .first() as { id_usuario: string | number; email_institucional: string } | undefined;
     if (!account) return { status: "not-found" };
     if (account.email_institucional !== expectedEmail) return { status: "stale" };
+
+    if (profile === "aluno") {
+      await transaction("aluno").select("id_usuario").where({ id_usuario: userId }).forUpdate().first();
+    }
+    const sessions = actor
+      ? await lockAdminMutationSessions(transaction, actor.token, actor.actorId,
+        emailChanged ? [userId] : [])
+      : undefined;
+    if (sessions && !sessions.authorized) throw new AdminSessionRevokedError();
 
     const update: Record<string, unknown> = {};
     if (input.name !== undefined) update.nome_completo = input.name;
@@ -274,7 +310,6 @@ export async function updateAccount(
     if (profile === "aluno" && input.guardianPhone !== undefined) {
       await transaction("aluno")
         .where({ id_usuario: userId })
-        .forUpdate()
         .update({ telefone_responsavel: input.guardianPhone });
     }
     if (emailChanged) {
@@ -286,94 +321,10 @@ export async function updateAccount(
     if (Object.keys(update).length > 0) {
       await transaction("usuario").where({ id_usuario: userId }).update(update);
     }
+    if (sessions && sessions.affectedSessionIds.length > 0) {
+      await transaction("sessao").whereIn("id_sessao", sessions.affectedSessionIds)
+        .whereNull("revogada_em").update({ revogada_em: transaction.raw("clock_timestamp()") });
+    }
     return { status: "updated", ...(emailChanged ? { previousEmail: account.email_institucional } : {}) };
-  });
-}
-
-export type AccountDeleteResult =
-  | { status: "deleted" }
-  | { status: "not-found" }
-  | { status: "student-linked-data" }
-  | { status: "teacher-linked-data" }
-  | { status: "cannot-delete-self" }
-  | { status: "last-active-administrator" };
-
-export async function deleteAccount(
-  knex: Knex,
-  profile: AccountProfile,
-  userId: string,
-  actorId: string
-): Promise<AccountDeleteResult> {
-  return knex.transaction(async (transaction) => {
-    if (profile === "administrador") {
-      await transaction.raw("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", [ADMIN_MEMBERSHIP_LOCK]);
-    }
-
-    await transaction("sessao")
-      .select("id_sessao")
-      .where({ id_usuario: userId })
-      .whereNull("revogada_em")
-      .orderBy("id_sessao")
-      .forUpdate();
-
-    const account = await transaction("usuario")
-      .select("id_usuario", "ativado_em")
-      .where({ id_usuario: userId, tipo_perfil: profile })
-      .whereNull("excluido_em")
-      .forUpdate()
-      .first() as { id_usuario: string | number; ativado_em: Date | string | null } | undefined;
-    if (!account) return { status: "not-found" };
-    if (profile === "administrador" && String(account.id_usuario) === actorId) {
-      return { status: "cannot-delete-self" };
-    }
-
-    if (profile === "aluno") {
-      await transaction("aluno").select("id_usuario").where({ id_usuario: userId }).forUpdate().first();
-      const activeEnrollment = await transaction("matricula")
-        .select("id_matricula")
-        .where({ id_usuario_aluno: userId })
-        .whereNull("fim_vigencia")
-        .whereNull("cancelada_em")
-        .first();
-      if (activeEnrollment) {
-        const completedSimulation = await transaction("simulado_aluno as sa")
-          .join("simulado as s", "s.id_simulado", "sa.id_simulado")
-          .select("sa.id_usuario_aluno")
-          .where("sa.id_usuario_aluno", userId)
-          .whereNotNull("s.instante_confirmacao_realizacao")
-          .first();
-        if (completedSimulation) return { status: "student-linked-data" };
-      }
-    }
-
-    if (profile === "professor") {
-      await transaction("professor").select("id_usuario").where({ id_usuario: userId }).forUpdate().first();
-      const linked = await transaction("turma_disciplina_professor")
-        .select("id_turma_disciplina")
-        .where({ id_usuario_professor: userId })
-        .first();
-      if (linked) return { status: "teacher-linked-data" };
-    }
-
-    if (profile === "administrador" && account.ativado_em !== null) {
-      const activeAdministrators = await transaction("usuario")
-        .select("id_usuario")
-        .where({ tipo_perfil: "administrador" })
-        .whereNotNull("ativado_em")
-        .whereNull("excluido_em")
-        .orderBy("id_usuario")
-        .forUpdate();
-      if (activeAdministrators.length <= 1) return { status: "last-active-administrator" };
-    }
-
-    await transaction("usuario")
-      .where({ id_usuario: userId })
-      .whereNull("excluido_em")
-      .update({ excluido_em: transaction.raw("clock_timestamp()") });
-    await transaction("sessao")
-      .where({ id_usuario: userId })
-      .whereNull("revogada_em")
-      .update({ revogada_em: transaction.raw("clock_timestamp()") });
-    return { status: "deleted" };
   });
 }

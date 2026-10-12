@@ -443,7 +443,7 @@ test("stale password verification cannot create a session after the account hash
   assert.deepEqual(verifiedHashes, ["synthetic-old-hash", "synthetic-current-hash"]);
   assert.deepEqual(result, { success: false });
   assert.equal(fixture.state.snapshots, 2);
-  assert.equal(fixture.state.lockedReads, 2);
+  assert.equal(fixture.state.lockedReads, 4);
   assert.equal(fixture.state.sessions.length, 0);
   assert.equal(fixture.state.updates.length, 1);
 });
@@ -486,7 +486,7 @@ test("login retry verifies the current account hash after a concurrent password 
   assert.deepEqual(verifiedHashes, ["synthetic-before-reset-hash", "synthetic-after-reset-hash"]);
   assert.equal(result.success, true);
   assert.equal(fixture.state.snapshots, 2);
-  assert.equal(fixture.state.lockedReads, 2);
+  assert.equal(fixture.state.lockedReads, 4);
   assert.equal(fixture.state.sessions.length, 1);
   assert.equal(fixture.state.updates.length, 1);
 });
@@ -530,7 +530,7 @@ test("login hash-change retries stop after the bounded attempt count", async () 
   ]);
   assert.deepEqual(result, { success: false });
   assert.equal(fixture.state.snapshots, 3);
-  assert.equal(fixture.state.lockedReads, 3);
+  assert.equal(fixture.state.lockedReads, 6);
   assert.equal(fixture.state.transactionCalls, 3);
   assert.equal(fixture.state.sessions.length, 0);
   assert.equal(fixture.state.updates.length, 0);
@@ -636,7 +636,7 @@ test("unexpected database errors become sanitized RFC 9457 responses without log
   for (const value of privateValues) assert.equal(serialized.includes(value), false);
 });
 
-test("all administrative account mutations reject Origin and custom-header failures before body or database access", async () => {
+test("administrative account mutations reject Origin and custom-header failures before body or database access", async () => {
   let databaseCalls = 0;
   const handlers = createAdminAccountHandlers({
     getDatabase() {
@@ -648,15 +648,12 @@ test("all administrative account mutations reject Origin and custom-header failu
   const mutations = [
     [handlers.createStudent, {}],
     [handlers.updateStudent, { studentId: "1" }],
-    [handlers.deleteStudent, { studentId: "1" }],
     [handlers.createTeacher, {}],
     [handlers.updateTeacher, { teacherId: "1" }],
-    [handlers.deleteTeacher, { teacherId: "1" }],
     [handlers.addClassSubjectTeacher, { classId: "1", subjectId: "1", teacherId: "1" }],
     [handlers.removeClassSubjectTeacher, { classId: "1", subjectId: "1", teacherId: "1" }],
     [handlers.createAdministrator, {}],
-    [handlers.updateAdministrator, { administratorId: "1" }],
-    [handlers.deleteAdministrator, { administratorId: "1" }]
+    [handlers.updateAdministrator, { administratorId: "1" }]
   ];
 
   for (const [handler, params] of mutations) {
@@ -692,6 +689,31 @@ test("all administrative account mutations reject Origin and custom-header failu
     assert.equal(jsonCalls, 0);
   }
 
+  assert.equal(databaseCalls, 0);
+});
+
+test("retired account DELETE routes return the same static 404 without database access", async () => {
+  let databaseCalls = 0;
+  const handlers = createAdminAccountHandlers({
+    getDatabase() {
+      databaseCalls += 1;
+      throw new Error("retired DELETE paths must not access the database");
+    },
+    allowedOrigins: [allowedOrigin]
+  });
+  const deletes = [handlers.deleteStudent, handlers.deleteTeacher, handlers.deleteAdministrator];
+  const responses = [];
+  for (const handler of deletes) {
+    for (const id of ["1", "999999", "not-an-id"]) {
+      responses.push(await handler({
+        method: "DELETE",
+        headers: new Headers({ origin: "https://attacker.example.test" }),
+        params: { studentId: id, teacherId: id, administratorId: id }
+      }, noContext));
+    }
+  }
+  for (const response of responses) assertProblem(response, 404, "RESOURCE_NOT_FOUND");
+  for (const response of responses.slice(1)) assert.deepEqual(response, responses[0]);
   assert.equal(databaseCalls, 0);
 });
 

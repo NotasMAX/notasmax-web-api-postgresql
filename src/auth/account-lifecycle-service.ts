@@ -171,14 +171,6 @@ async function consumeTokenAndUpdateAccount(
 ): Promise<boolean> {
   try {
     return await knex.transaction(async (transaction) => {
-      // Session operations lock session rows before the account; keep that order to avoid cycles with login/inspection.
-      await transaction("sessao")
-        .select("id_sessao")
-        .where({ id_usuario: userId })
-        .whereNull("revogada_em")
-        .orderBy("id_sessao")
-        .forUpdate();
-
       const account = await transaction("usuario")
         .select("id_usuario", "hash_senha", "email_pendente", "ativado_em", "excluido_em")
         .where({ id_usuario: userId })
@@ -187,6 +179,13 @@ async function consumeTokenAndUpdateAccount(
           "id_usuario" | "hash_senha" | "email_pendente" | "ativado_em" | "excluido_em"> | undefined;
       if (!account || account.excluido_em !== null) return false;
       if (activate ? account.ativado_em !== null : !isEligibleActiveAccount(account)) return false;
+
+      const activeSessions = await transaction("sessao")
+        .select("id_sessao")
+        .where({ id_usuario: userId })
+        .whereNull("revogada_em")
+        .orderBy("id_sessao")
+        .forUpdate() as Array<{ id_sessao: string | number }>;
 
       const consumed = await transaction(table)
         .where({ id_usuario: userId, hash_token_sha256: tokenHash })
@@ -219,8 +218,7 @@ async function consumeTokenAndUpdateAccount(
       if (updated.length !== 1) throw new LifecycleStateChanged();
 
       if (!activate || account.email_pendente !== null) {
-        await transaction("sessao")
-          .where({ id_usuario: userId })
+        await transaction("sessao").whereIn("id_sessao", activeSessions.map((session) => session.id_sessao))
           .whereNull("revogada_em")
           .update({ revogada_em: transaction.raw("clock_timestamp()") });
       }

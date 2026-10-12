@@ -4,9 +4,14 @@ const { createInterface } = require("node:readline");
 const { emitKeypressEvents } = require("node:readline");
 const argon2 = require("argon2");
 const knexFactory = require("knex");
+const { z } = require("zod");
 const { assertLoopbackHost } = require("../src/database/local-only.cjs");
 
 const ADMIN_SEED_LOCK = [324001, 1];
+const ADMIN_EMAIL_PROMPT = "Administrator email (valid format, up to 254 characters; surrounding spaces are trimmed and the address is lowercased): ";
+const ADMIN_PASSWORD_PROMPT = "Administrator password (15-1024 characters; no composition rule; spaces and Unicode are allowed): ";
+const emailSchema = z.string().trim().toLowerCase().email().max(254);
+const passwordSchema = z.string().min(15).max(1024);
 
 function normalizeAdminInput({ name, email, password }) {
   if (typeof name !== "string") {
@@ -17,19 +22,17 @@ function normalizeAdminInput({ name, email, password }) {
     throw new Error("Administrator name is invalid.");
   }
 
-  if (typeof email !== "string") {
-    throw new Error("Administrator email is required.");
-  }
-  const normalizedEmail = email.trim().toLowerCase();
-  if (normalizedEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+  const normalizedEmail = emailSchema.safeParse(email);
+  if (!normalizedEmail.success) {
     throw new Error("Administrator email is invalid.");
   }
 
-  if (typeof password !== "string" || password.length === 0) {
-    throw new Error("Administrator password is required.");
+  const validatedPassword = passwordSchema.safeParse(password);
+  if (!validatedPassword.success) {
+    throw new Error("Administrator password is invalid.");
   }
 
-  return { name: normalizedName, email: normalizedEmail, password };
+  return { name: normalizedName, email: normalizedEmail.data, password: validatedPassword.data };
 }
 
 async function createInitialAdmin({ knex, name, email, password }) {
@@ -136,8 +139,8 @@ async function runSeed({
   }
 
   const name = await readVisible("Administrator full name: ", { input, output });
-  const email = await readVisible("Administrator email: ", { input, output });
-  let password = await readHidden("Administrator password: ", { input, output });
+  const email = await readVisible(ADMIN_EMAIL_PROMPT, { input, output });
+  let password = await readHidden(ADMIN_PASSWORD_PROMPT, { input, output });
   const database = injectedDatabase || knexFactory(knexConfig);
   try {
     await createInitialAdmin({ knex: database, name, email, password });
@@ -165,4 +168,11 @@ if (require.main === module) {
   runSeedCommand().then((exitCode) => { process.exitCode = exitCode; });
 }
 
-module.exports = { createInitialAdmin, normalizeAdminInput, readHidden, runSeedCommand };
+module.exports = {
+  ADMIN_EMAIL_PROMPT,
+  ADMIN_PASSWORD_PROMPT,
+  createInitialAdmin,
+  normalizeAdminInput,
+  readHidden,
+  runSeedCommand
+};

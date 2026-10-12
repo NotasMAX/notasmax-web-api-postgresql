@@ -38,11 +38,11 @@ app.http("adminClassUpdate", {
   handler: handlers.updateClass
 });
 
-app.http("adminClassDelete", {
-  methods: ["DELETE"],
+app.http("adminClassClose", {
+  methods: ["POST"],
   authLevel: "anonymous",
-  route: "v1/admin/classes/{classId}",
-  handler: handlers.deleteClass
+  route: "v1/admin/classes/{classId}/close",
+  handler: handlers.closeClass
 });
 
 app.http("adminClassSubjectsList", {

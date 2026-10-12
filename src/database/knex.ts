@@ -1,4 +1,5 @@
 import knexFactory, { type Knex } from "knex";
+import { configurePostgresTimeZone } from "./postgres-timezone";
 
 let workerKnex: Knex | undefined;
 
@@ -43,7 +44,8 @@ export function getKnex(): Knex {
       pool: {
         min: 0,
         max: 5,
-        acquireTimeoutMillis: 2500
+        acquireTimeoutMillis: 2500,
+        afterCreate: configurePostgresTimeZone
       },
       compileSqlOnError: false,
       log: {

@@ -28,7 +28,7 @@ type RequestHandler = (
 ) => Promise<HttpResponseInit>;
 
 export type AdminGuardResult =
-  | { authorized: true; user: SessionIdentity }
+  | { authorized: true; user: SessionIdentity; token: string }
   | { authorized: false; response: HttpResponseInit };
 
 export function configuredOrigins(): string[] {
@@ -49,7 +49,7 @@ export function configuredOrigins(): string[] {
     });
 }
 
-function authenticationRequired(): HttpResponseInit {
+export function authenticationRequired(): HttpResponseInit {
   return createProblemResponse({
     status: 401,
     title: "Autenticação necessária",
@@ -161,7 +161,7 @@ export async function requireAdminSession(
   if (current.user.profile !== "administrador") {
     return { authorized: false, response: resourceNotFound() };
   }
-  return { authorized: true, user: current.user };
+  return { authorized: true, user: current.user, token };
 }
 
 export function createAuthHandlers(options: {

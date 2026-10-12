@@ -9,6 +9,13 @@ const FAILURE_WINDOW_MS = 15 * 60 * 1000;
 const LOCKOUT_MS = 15 * 60 * 1000;
 const ACCOUNT_RECHECK_ATTEMPTS = 3;
 
+export class AdminSessionRevokedError extends Error {
+  constructor() {
+    super("Administrator session is no longer valid.");
+    this.name = "AdminSessionRevokedError";
+  }
+}
+
 type AccountRow = {
   id_usuario: string | number;
   email_institucional: string;
@@ -129,15 +136,33 @@ export async function createLoginSession(
     if (!snapshot) return { success: false };
 
     const result = await knex.transaction(async (transaction) => {
-      let previousSession: Pick<SessionRow, "id_sessao"> | undefined;
-      if (previousToken) {
-        previousSession = await transaction("sessao")
-          .select("id_sessao")
+      const previousSessionReference = previousToken
+        ? await transaction("sessao")
+          .select("id_sessao", "id_usuario")
           .where({ hash_token_sha256: hashOpaqueToken(previousToken) })
           .whereNull("revogada_em")
-          .forUpdate()
-          .first() as Pick<SessionRow, "id_sessao"> | undefined;
+          .first() as Pick<SessionRow, "id_sessao" | "id_usuario"> | undefined
+        : undefined;
+
+      const identityIds = [...new Set([
+        String(snapshot.id_usuario),
+        ...(previousSessionReference ? [String(previousSessionReference.id_usuario)] : [])
+      ])].sort((left, right) => BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0);
+      for (const id of identityIds) {
+        await transaction("usuario").select("id_usuario").where({ id_usuario: id }).forUpdate().first();
       }
+
+      const previousSession = previousSessionReference
+        ? await transaction("sessao")
+          .select("id_sessao")
+          .where({
+            id_sessao: previousSessionReference.id_sessao,
+            hash_token_sha256: hashOpaqueToken(previousToken as string)
+          })
+          .whereNull("revogada_em")
+          .forUpdate()
+          .first() as Pick<SessionRow, "id_sessao"> | undefined
+        : undefined;
 
       const account = await transaction("usuario")
         .select(
@@ -153,7 +178,6 @@ export async function createLoginSession(
           "bloqueado_ate"
         )
         .where({ id_usuario: snapshot.id_usuario })
-        .forUpdate()
         .first() as AccountRow | undefined;
 
       if (!account || account.email_institucional !== credentials.email
@@ -288,9 +312,22 @@ export async function reauthenticateAdministrator(
 
 export async function inspectSession(knex: Knex, token: string): Promise<CurrentSessionResult> {
   return knex.transaction(async (transaction) => {
+    const reference = await transaction("sessao")
+      .select("id_sessao", "id_usuario")
+      .where({ hash_token_sha256: hashOpaqueToken(token) })
+      .whereNull("revogada_em")
+      .first() as SessionRow | undefined;
+    if (!reference) return { authenticated: false };
+
+    const account = await transaction("usuario")
+      .select("id_usuario", "tipo_perfil", "nome_completo", "ativado_em", "excluido_em")
+      .where({ id_usuario: reference.id_usuario })
+      .forUpdate()
+      .first() as Pick<AccountRow, "id_usuario" | "tipo_perfil" | "nome_completo" | "ativado_em" | "excluido_em"> | undefined;
+
     const session = await transaction("sessao")
       .select("id_sessao", "id_usuario", "expira_em", "expira_absoluta_em")
-      .where({ hash_token_sha256: hashOpaqueToken(token) })
+      .where({ id_sessao: reference.id_sessao, hash_token_sha256: hashOpaqueToken(token) })
       .whereNull("revogada_em")
       .forUpdate()
       .first() as SessionRow | undefined;
@@ -307,11 +344,6 @@ export async function inspectSession(knex: Knex, token: string): Promise<Current
       return { authenticated: false };
     }
 
-    const account = await transaction("usuario")
-      .select("id_usuario", "tipo_perfil", "nome_completo", "ativado_em", "excluido_em")
-      .where({ id_usuario: session.id_usuario })
-      .forShare()
-      .first() as Pick<AccountRow, "id_usuario" | "tipo_perfil" | "nome_completo" | "ativado_em" | "excluido_em"> | undefined;
     if (!account || account.ativado_em === null || account.excluido_em !== null) {
       await transaction("sessao")
         .where({ id_sessao: session.id_sessao })
@@ -334,9 +366,18 @@ export async function inspectSession(knex: Knex, token: string): Promise<Current
 
 export async function revokeSession(knex: Knex, token: string): Promise<boolean> {
   return knex.transaction(async (transaction) => {
+    const reference = await transaction("sessao")
+      .select("id_sessao", "id_usuario")
+      .where({ hash_token_sha256: hashOpaqueToken(token) })
+      .whereNull("revogada_em")
+      .first() as Pick<SessionRow, "id_sessao" | "id_usuario"> | undefined;
+    if (!reference) return false;
+
+    await transaction("usuario").select("id_usuario")
+      .where({ id_usuario: reference.id_usuario }).forUpdate().first();
     const session = await transaction("sessao")
       .select("id_sessao", "expira_em", "expira_absoluta_em")
-      .where({ hash_token_sha256: hashOpaqueToken(token) })
+      .where({ id_sessao: reference.id_sessao, hash_token_sha256: hashOpaqueToken(token) })
       .whereNull("revogada_em")
       .forUpdate()
       .first() as Pick<SessionRow, "id_sessao" | "expira_em" | "expira_absoluta_em"> | undefined;
@@ -351,4 +392,43 @@ export async function revokeSession(knex: Knex, token: string): Promise<boolean>
       .update({ revogada_em: now });
     return !expired;
   });
+}
+
+export async function lockAdminMutationSessions(
+  transaction: Knex.Transaction,
+  token: string,
+  actorId: string,
+  affectedUserIds: readonly string[] = []
+): Promise<{ authorized: boolean; affectedSessionIds: string[] }> {
+  const account = await transaction("usuario")
+    .select("id_usuario", "tipo_perfil", "hash_senha", "ativado_em", "excluido_em")
+    .where({ id_usuario: actorId })
+    .forShare()
+    .first() as Pick<AccountRow, "id_usuario" | "tipo_perfil" | "hash_senha" | "ativado_em" | "excluido_em"> | undefined;
+  if (!account || !accountIsActiveAdministrator(account)) {
+    return { authorized: false, affectedSessionIds: [] };
+  }
+
+  const targetIds = [...new Set(affectedUserIds.map(String).filter((id) => id !== actorId))];
+  const lockedIds = [...new Set([actorId, ...targetIds])];
+  const sessions = await transaction("sessao")
+    .select("id_sessao", "id_usuario", "hash_token_sha256", "expira_em", "expira_absoluta_em")
+    .whereIn("id_usuario", lockedIds)
+    .whereNull("revogada_em")
+    .orderBy("id_sessao", "asc")
+    .forUpdate() as Array<SessionRow & { hash_token_sha256: Buffer }>;
+
+  const current = sessions.find((session) =>
+    session.hash_token_sha256.equals(hashOpaqueToken(token)) && String(session.id_usuario) === actorId
+  );
+  const now = await databaseNow(transaction);
+  const authorized = current !== undefined
+    && asDate(current.expira_em).getTime() > now.getTime()
+    && asDate(current.expira_absoluta_em).getTime() > now.getTime();
+  return {
+    authorized,
+    affectedSessionIds: sessions
+      .filter((session) => targetIds.includes(String(session.id_usuario)))
+      .map((session) => String(session.id_sessao))
+  };
 }

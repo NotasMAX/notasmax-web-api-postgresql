@@ -7,7 +7,13 @@ const path = require("node:path");
 const { test } = require("node:test");
 const argon2 = require("argon2");
 const { isLoopbackHost } = require("../src/database/local-only.cjs");
-const { createInitialAdmin, runSeedCommand } = require("../seed/admin.cjs");
+const {
+  ADMIN_EMAIL_PROMPT,
+  ADMIN_PASSWORD_PROMPT,
+  createInitialAdmin,
+  normalizeAdminInput,
+  runSeedCommand
+} = require("../seed/admin.cjs");
 
 const repository = path.resolve(__dirname, "..");
 
@@ -24,8 +30,8 @@ function makeInteractiveTerminal(responses) {
   const stderr = [];
   const prompts = [
     "Administrator full name: ",
-    "Administrator email: ",
-    "Administrator password: "
+    ADMIN_EMAIL_PROMPT,
+    ADMIN_PASSWORD_PROMPT
   ];
   const answered = new Set();
   let outputSoFar = "";
@@ -57,6 +63,7 @@ function makeInteractiveTerminal(responses) {
 
 function makeSyntheticKnex() {
   let inserted;
+  let transactionCalls = 0;
   const query = {
     select() { return this; },
     where() { return this; },
@@ -72,8 +79,12 @@ function makeSyntheticKnex() {
 
   return {
     client: { config: { connection: { host: "127.0.0.1" } } },
-    transaction: async (callback) => callback(transaction),
-    get inserted() { return inserted; }
+    transaction: async (callback) => {
+      transactionCalls += 1;
+      return callback(transaction);
+    },
+    get inserted() { return inserted; },
+    get transactionCalls() { return transactionCalls; }
   };
 }
 
@@ -147,12 +158,79 @@ test("migration and seed entry points reject non-loopback hosts before database 
   assert.equal(transactionCalled, false);
 });
 
+test("seed email and password limits match the existing API policy", () => {
+  const email254 = `a@${"x".repeat(63)}.${"y".repeat(63)}.${"z".repeat(63)}.${"w".repeat(60)}`;
+  const email255 = `a@${"x".repeat(63)}.${"y".repeat(63)}.${"z".repeat(63)}.${"w".repeat(61)}`;
+  assert.equal(email254.length, 254);
+  assert.equal(email255.length, 255);
+
+  const normalized = normalizeAdminInput({
+    name: " Synthetic Administrator ",
+    email: ` ${email254.toUpperCase()} `,
+    password: " ".repeat(15)
+  });
+  assert.equal(normalized.name, "Synthetic Administrator");
+  assert.equal(normalized.email, email254.toLowerCase());
+  assert.equal(normalized.password.length, 15);
+  assert.equal(normalizeAdminInput({
+    name: "Synthetic Administrator",
+    email: " Seed.User@Example.Test ",
+    password: "☃".repeat(1024)
+  }).password.length, 1024);
+
+  for (const invalidEmail of [email255, "not-an-email"]) {
+    assert.throws(() => normalizeAdminInput({
+      name: "Synthetic Administrator",
+      email: invalidEmail,
+      password: "synthetic-valid-password"
+    }), /email is invalid/);
+  }
+  for (const invalidPassword of ["x".repeat(14), "x".repeat(1025)]) {
+    assert.throws(() => normalizeAdminInput({
+      name: "Synthetic Administrator",
+      email: "admin@example.test",
+      password: invalidPassword
+    }), /password is invalid/);
+  }
+});
+
+test("invalid seed inputs are rejected before password hashing or database transaction", async () => {
+  const database = makeSyntheticKnex();
+  const originalHash = argon2.hash;
+  let hashCalls = 0;
+  argon2.hash = async (...arguments_) => {
+    hashCalls += 1;
+    return originalHash(...arguments_);
+  };
+
+  try {
+    await assert.rejects(createInitialAdmin({
+      knex: database,
+      name: "Synthetic Administrator",
+      email: "invalid-email",
+      password: "synthetic-valid-password"
+    }), /email is invalid/);
+    await assert.rejects(createInitialAdmin({
+      knex: database,
+      name: "Synthetic Administrator",
+      email: "admin@example.test",
+      password: "too-short"
+    }), /password is invalid/);
+  } finally {
+    argon2.hash = originalHash;
+  }
+
+  assert.equal(hashCalls, 0);
+  assert.equal(database.transactionCalls, 0);
+  assert.equal(database.inserted, undefined);
+});
+
 test("interactive seed command keeps password and hash out of output on success", async () => {
   const password = "synthetic-success-password";
   const terminal = makeInteractiveTerminal({
     "Administrator full name: ": (input) => input.write("Synthetic Administrator\n"),
-    "Administrator email: ": (input) => input.write("seed-success@example.test\n"),
-    "Administrator password: ": (input) => input.write(`${password}\r`)
+    [ADMIN_EMAIL_PROMPT]: (input) => input.write("seed-success@example.test\n"),
+    [ADMIN_PASSWORD_PROMPT]: (input) => input.write(`${password}\r`)
   });
   const database = makeSyntheticKnex();
 
@@ -162,14 +240,17 @@ test("interactive seed command keeps password and hash out of output on success"
   assert.equal(await argon2.verify(database.inserted.hash_senha, password), true);
   assert.deepEqual(terminal.input.rawModeChanges.slice(-2), [true, false]);
   assertNoSecretOutput(terminal, [password, database.inserted.hash_senha]);
+  assert.match(terminal.stdout.join(""), /up to 254 characters/);
+  assert.match(terminal.stdout.join(""), /15-1024 characters/);
+  assert.match(terminal.stdout.join(""), /no composition rule; spaces and Unicode are allowed/);
 });
 
 test("interactive seed command keeps password out of output when validation fails", async () => {
   const password = "synthetic-validation-password";
   const terminal = makeInteractiveTerminal({
     "Administrator full name: ": (input) => input.write("Synthetic Administrator\n"),
-    "Administrator email: ": (input) => input.write("invalid-email\n"),
-    "Administrator password: ": (input) => input.write(`${password}\r`)
+    [ADMIN_EMAIL_PROMPT]: (input) => input.write("invalid-email\n"),
+    [ADMIN_PASSWORD_PROMPT]: (input) => input.write(`${password}\r`)
   });
   const database = makeSyntheticKnex();
 
@@ -184,8 +265,8 @@ test("interactive seed command keeps partial password input out of output on can
   const passwordPrefix = "synthetic-canceled-password";
   const terminal = makeInteractiveTerminal({
     "Administrator full name: ": (input) => input.write("Synthetic Administrator\n"),
-    "Administrator email: ": (input) => input.write("seed-cancel@example.test\n"),
-    "Administrator password: ": (input) => {
+    [ADMIN_EMAIL_PROMPT]: (input) => input.write("seed-cancel@example.test\n"),
+    [ADMIN_PASSWORD_PROMPT]: (input) => {
       input.write(passwordPrefix);
       setImmediate(() => input.write("\x03"));
     }

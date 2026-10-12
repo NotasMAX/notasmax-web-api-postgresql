@@ -3,9 +3,11 @@ import type { Knex } from "knex";
 import { z } from "zod";
 import { getKnex } from "../database/knex";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
+import { ifMatchProblem, readIfMatch } from "../http/etag";
 import { logSecurityEvent, withSecurityEvent } from "../http/security-event";
 import {
   authenticationFailed,
+  authenticationRequired,
   configuredOrigins,
   internalFailure,
   mutationRejection,
@@ -16,7 +18,6 @@ import {
   accountDetail,
   accountForEdit,
   createAccount,
-  deleteAccount,
   listAccounts,
   updateAccount,
   type AccountListQuery,
@@ -173,6 +174,18 @@ function conflict(code: string, title: string, detail: string): HttpResponseInit
   });
 }
 
+function classClosed(): HttpResponseInit {
+  return conflict(
+    "CLASS_CLOSED",
+    "Turma fechada",
+    "A operação não pode ser concluída porque a turma está fechada."
+  );
+}
+
+function sessionWasRevoked(error: unknown): boolean {
+  return error instanceof Error && error.name === "AdminSessionRevokedError";
+}
+
 function isUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error
     && (error as { code?: unknown }).code === "23505";
@@ -267,7 +280,9 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
       }
 
       try {
-        const userId = await createAccount(getDatabase(), profile, body.data as NewAccount);
+        const userId = await createAccount(getDatabase(), profile, body.data as NewAccount, {
+          actorId: authorized.user.id, token: authorized.token
+        });
         const activationEmailStatus = await sendActivation(getDatabase(), userId, adapter);
         return {
           status: 201,
@@ -275,6 +290,7 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
           jsonBody: { activationEmailStatus }
         };
       } catch (error) {
+        if (sessionWasRevoked(error)) return authenticationRequired();
         return isUniqueViolation(error) ? emailAlreadyInUse() : internalFailure();
       }
     }
@@ -355,7 +371,9 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
           }
         }
 
-        const result = await updateAccount(getDatabase(), profile, userId, current.email, input);
+        const result = await updateAccount(getDatabase(), profile, userId, current.email, input, {
+          actorId: authorized.user.id, token: authorized.token
+        });
         if (result.status === "not-found") return profileNotFound(profile);
         if (result.status === "stale") {
           current = await accountForEdit(getDatabase(), profile, userId);
@@ -382,58 +400,12 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
       }
       return internalFailure();
     } catch (error) {
+      if (sessionWasRevoked(error)) return authenticationRequired();
       return isUniqueViolation(error) ? emailAlreadyInUse() : internalFailure();
     }
   });
 
-  const remove = (profile: AccountProfile, paramName: string): RequestHandler => withSecurityEvent(
-    "admin_account_delete",
-    async (request) => {
-      const rejected = mutationRejection(request, allowedOrigins);
-      if (rejected) return rejected;
-      const route = accountId(request, paramName);
-      if (!route.success) return route.response;
-      const authorized = await requireAdminSession(request, getDatabase);
-      if (!authorized.authorized) return authorized.response;
-      try {
-        const result = await deleteAccount(
-          getDatabase(), profile, route.data[paramName] as string, authorized.user.id
-        );
-        if (result.status === "not-found") return profileNotFound(profile);
-        if (result.status === "student-linked-data") {
-          return conflict(
-            "STUDENT_CANNOT_BE_DELETED",
-            "Aluno não pode ser excluído",
-            "O aluno possui matrícula ativa e vínculo com simulado realizado."
-          );
-        }
-        if (result.status === "teacher-linked-data") {
-          return conflict(
-            "TEACHER_HAS_LINKED_DATA",
-            "Professor possui vínculos",
-            "Remova as associações de matéria e turma antes de excluir o professor."
-          );
-        }
-        if (result.status === "cannot-delete-self") {
-          return conflict(
-            "ADMINISTRATOR_CANNOT_DELETE_SELF",
-            "Operação não permitida",
-            "Um administrador não pode excluir a própria conta."
-          );
-        }
-        if (result.status === "last-active-administrator") {
-          return conflict(
-            "LAST_ACTIVE_ADMIN_CANNOT_BE_DELETED",
-            "Operação não permitida",
-            "A exclusão não pode remover o último administrador ativo."
-          );
-        }
-        return { status: 204, headers: { "cache-control": "no-store" } };
-      } catch {
-        return internalFailure();
-      }
-    }
-  );
+  const retiredDelete: RequestHandler = async () => resourceNotFound();
 
   const classSubjectPathSchema = z.strictObject({ classId: idSchema, subjectId: idSchema });
   const teacherAssociationPathSchema = classSubjectPathSchema.extend({ teacherId: idSchema });
@@ -450,7 +422,11 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
       );
       return result.status === "not-found"
         ? resourceNotFound()
-        : { status: 200, headers: { "cache-control": "no-store" }, jsonBody: { items: result.items } };
+        : {
+          status: 200,
+          headers: { "cache-control": "no-store", etag: result.etag },
+          jsonBody: { items: result.items }
+        };
     } catch {
       return internalFailure();
     }
@@ -465,15 +441,20 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
       if (!route.success) return route.response;
       const authorized = await requireAdminSession(request, getDatabase);
       if (!authorized.authorized) return authorized.response;
+      const precondition = readIfMatch(request);
+      if (precondition.status !== "ok") return ifMatchProblem(precondition.status);
 
       try {
         const result = await addCurrentTeacher(
-          getDatabase(), route.data.classId, route.data.subjectId, route.data.teacherId
+          getDatabase(), route.data.classId, route.data.subjectId, route.data.teacherId,
+          precondition.value, { actorId: authorized.user.id, token: authorized.token }
         );
-        return result.status === "not-found"
-          ? resourceNotFound()
-          : { status: 204, headers: { "cache-control": "no-store" } };
-      } catch {
+        if (result.status === "not-found") return resourceNotFound();
+        if (result.status === "stale") return ifMatchProblem("stale");
+        if (result.status === "class-closed") return classClosed();
+        return { status: 204, headers: { "cache-control": "no-store", etag: result.etag } };
+      } catch (error) {
+        if (sessionWasRevoked(error)) return authenticationRequired();
         return internalFailure();
       }
     }
@@ -488,15 +469,20 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
       if (!route.success) return route.response;
       const authorized = await requireAdminSession(request, getDatabase);
       if (!authorized.authorized) return authorized.response;
+      const precondition = readIfMatch(request);
+      if (precondition.status !== "ok") return ifMatchProblem(precondition.status);
 
       try {
         const result = await removeCurrentTeacher(
-          getDatabase(), route.data.classId, route.data.subjectId, route.data.teacherId
+          getDatabase(), route.data.classId, route.data.subjectId, route.data.teacherId,
+          precondition.value, { actorId: authorized.user.id, token: authorized.token }
         );
-        return result.status === "not-found"
-          ? resourceNotFound()
-          : { status: 204, headers: { "cache-control": "no-store" } };
-      } catch {
+        if (result.status === "not-found") return resourceNotFound();
+        if (result.status === "stale") return ifMatchProblem("stale");
+        if (result.status === "class-closed") return classClosed();
+        return { status: 204, headers: { "cache-control": "no-store", etag: result.etag } };
+      } catch (error) {
+        if (sessionWasRevoked(error)) return authenticationRequired();
         return internalFailure();
       }
     }
@@ -507,12 +493,12 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
     createStudent: create("aluno", studentCreateSchema),
     getStudent: get("aluno", "studentId"),
     updateStudent: update("aluno", "studentId", studentPatchSchema),
-    deleteStudent: remove("aluno", "studentId"),
+    deleteStudent: retiredDelete,
     listTeachers: list("professor", teacherQuerySchema),
     createTeacher: create("professor", personCreateSchema),
     getTeacher: get("professor", "teacherId"),
     updateTeacher: update("professor", "teacherId", personPatchSchema),
-    deleteTeacher: remove("professor", "teacherId"),
+    deleteTeacher: retiredDelete,
     listClassSubjectTeachers,
     addClassSubjectTeacher,
     removeClassSubjectTeacher,
@@ -520,6 +506,6 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
     createAdministrator: create("administrador", personCreateSchema),
     getAdministrator: get("administrador", "administratorId"),
     updateAdministrator: update("administrador", "administratorId", personPatchSchema),
-    deleteAdministrator: remove("administrador", "administratorId")
+    deleteAdministrator: retiredDelete
   };
 }

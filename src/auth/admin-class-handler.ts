@@ -4,7 +4,9 @@ import { z } from "zod";
 import { getKnex } from "../database/knex";
 import { withSecurityEvent } from "../http/security-event";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
+import { ifMatchProblem, readIfMatch } from "../http/etag";
 import {
+  authenticationRequired,
   configuredOrigins,
   internalFailure,
   mutationRejection,
@@ -13,8 +15,8 @@ import {
 } from "./handler";
 import {
   addClassSubject,
+  closeClass,
   createClass,
-  deleteClass,
   getClass,
   listActiveSchoolYears,
   listClasses,
@@ -45,15 +47,19 @@ const classListQuerySchema = z.strictObject({
   pageSize: positiveIntegerString.default("20").transform(Number)
     .pipe(z.number().int().safe().positive().max(100))
 }).transform((query) => ({
-  ...query,
-  schoolYear: query.schoolYear ?? new Date().getUTCFullYear()
+  ...query
 }));
 const classIdSchema = z.strictObject({ classId: idSchema });
 const classSubjectPathSchema = classIdSchema.extend({ subjectId: idSchema });
 const seriesSchema = z.number().int().refine((value) => value === 1 || value === 2 || value === 3);
 const createSchema = z.strictObject({
   series: seriesSchema,
-  schoolYear: postgresInteger
+  schoolYear: postgresInteger,
+  startDate: z.iso.date(),
+  closeClassIds: z.array(z.strictObject({
+    classId: idSchema,
+    expectedVersion: z.number().int().positive()
+  })).optional()
 });
 const patchSchema = z.strictObject({
   series: seriesSchema.optional(),
@@ -93,11 +99,38 @@ function classAlreadyExists(): HttpResponseInit {
   );
 }
 
+function classSelectionInvalid(): HttpResponseInit {
+  return createProblemResponse({
+    status: 409,
+    title: "Seleção de turmas inválida",
+    code: "CLASS_SELECTION_INVALID",
+    detail: "A seleção de turmas não pôde ser aplicada. Atualize os dados e tente novamente.",
+    errors: [{
+      code: "INVALID_VALUE",
+      detail: "A seleção de turmas não pôde ser aplicada.",
+      source: { in: "body", pointer: "/closeClassIds" }
+    }],
+    headers: { "cache-control": "no-store" }
+  });
+}
+
+function sessionWasRevoked(error: unknown): boolean {
+  return error instanceof Error && error.name === "AdminSessionRevokedError";
+}
+
 function classHasLinkedData(): HttpResponseInit {
   return conflict(
     "CLASS_HAS_LINKED_DATA",
     "Turma possui vínculos",
     "A operação não pode ser concluída enquanto a turma possuir os vínculos definidos para esta ação."
+  );
+}
+
+function classClosed(): HttpResponseInit {
+  return conflict(
+    "CLASS_CLOSED",
+    "Turma fechada",
+    "A operação não pode ser concluída porque a turma está fechada."
   );
 }
 
@@ -120,7 +153,8 @@ function simulationResults(): HttpResponseInit {
 function isClassUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && "constraint" in error
     && (error as { code?: unknown }).code === "23505"
-    && (error as { constraint?: unknown }).constraint === "turma_serie_ano_ativa_uk";
+    && ((error as { constraint?: unknown }).constraint === "turma_serie_ano_uk"
+      || (error as { constraint?: unknown }).constraint === "turma_serie_ano_ativa_uk");
 }
 
 export type AdminClassHandlerOptions = {
@@ -134,7 +168,7 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
   getClass: RequestHandler;
   createClass: RequestHandler;
   updateClass: RequestHandler;
-  deleteClass: RequestHandler;
+  closeClass: RequestHandler;
   listClassSubjects: RequestHandler;
   addClassSubject: RequestHandler;
   removeClassSubject: RequestHandler;
@@ -177,7 +211,7 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
     try {
       const schoolClass = await getClass(getDatabase(), route.data.classId);
       return schoolClass
-        ? { status: 200, headers: { "cache-control": "no-store" }, jsonBody: schoolClass }
+        ? { status: 200, headers: { "cache-control": "no-store", etag: schoolClass.etag }, jsonBody: schoolClass.schoolClass }
         : classNotFound();
     } catch {
       return internalFailure();
@@ -198,9 +232,17 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
     if (!authorized.authorized) return authorized.response;
 
     try {
-      const schoolClass = await createClass(getDatabase(), body.data as NewClass);
-      return { status: 201, headers: { "cache-control": "no-store" }, jsonBody: schoolClass };
+      const result = await createClass(getDatabase(), body.data as NewClass, {
+        actorId: authorized.user.id, token: authorized.token
+      });
+      if (result.status === "selection-invalid") return classSelectionInvalid();
+      return {
+        status: 201,
+        headers: { "cache-control": "no-store", etag: result.etag },
+        jsonBody: result.schoolClass
+      };
     } catch (error) {
+      if (sessionWasRevoked(error)) return authenticationRequired();
       return isClassUniqueViolation(error) ? classAlreadyExists() : internalFailure();
     }
   });
@@ -219,31 +261,45 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
     if (!body.success) return body.response;
     const authorized = await requireAdminSession(request, getDatabase);
     if (!authorized.authorized) return authorized.response;
+    const precondition = readIfMatch(request);
+    if (precondition.status !== "ok") return ifMatchProblem(precondition.status);
 
     try {
-      const result = await updateClass(getDatabase(), route.data.classId, body.data as ClassPatch);
+      const result = await updateClass(getDatabase(), route.data.classId, body.data as ClassPatch,
+        precondition.value, { actorId: authorized.user.id, token: authorized.token });
       if (result.status === "not-found") return classNotFound();
       if (result.status === "has-linked-data") return classHasLinkedData();
-      return { status: 200, headers: { "cache-control": "no-store" }, jsonBody: result.schoolClass };
+      if (result.status === "stale") return ifMatchProblem("stale");
+      return {
+        status: 200,
+        headers: { "cache-control": "no-store", etag: result.etag },
+        jsonBody: result.schoolClass
+      };
     } catch (error) {
+      if (sessionWasRevoked(error)) return authenticationRequired();
       return isClassUniqueViolation(error) ? classAlreadyExists() : internalFailure();
     }
   });
 
-  const remove: RequestHandler = withSecurityEvent("admin_class_delete", async (request) => {
+  const close: RequestHandler = withSecurityEvent("admin_class_close", async (request) => {
     const rejected = mutationRejection(request, allowedOrigins);
     if (rejected) return rejected;
     const route = validateInput(classIdSchema, request.params, { in: "path" });
     if (!route.success) return route.response;
     const authorized = await requireAdminSession(request, getDatabase);
     if (!authorized.authorized) return authorized.response;
+    const precondition = readIfMatch(request);
+    if (precondition.status !== "ok") return ifMatchProblem(precondition.status);
 
     try {
-      const result = await deleteClass(getDatabase(), route.data.classId);
-      if (result === "not-found") return classNotFound();
-      if (result === "has-linked-data") return classHasLinkedData();
-      return { status: 204, headers: { "cache-control": "no-store" } };
-    } catch {
+      const result = await closeClass(getDatabase(), route.data.classId, precondition.value, {
+        actorId: authorized.user.id, token: authorized.token
+      });
+      if (result.status === "not-found") return classNotFound();
+      if (result.status === "stale") return ifMatchProblem("stale");
+      return { status: 204, headers: { "cache-control": "no-store", etag: result.etag } };
+    } catch (error) {
+      if (sessionWasRevoked(error)) return authenticationRequired();
       return internalFailure();
     }
   });
@@ -258,7 +314,7 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
       const result = await listClassSubjects(getDatabase(), route.data.classId);
       return result.status === "not-found"
         ? resourceNotFound()
-        : { status: 200, headers: { "cache-control": "no-store" }, jsonBody: { items: result.items } };
+        : { status: 200, headers: { "cache-control": "no-store", etag: result.etag }, jsonBody: { items: result.items } };
     } catch {
       return internalFailure();
     }
@@ -271,13 +327,21 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
     if (!route.success) return route.response;
     const authorized = await requireAdminSession(request, getDatabase);
     if (!authorized.authorized) return authorized.response;
+    const precondition = readIfMatch(request);
+    if (precondition.status !== "ok") return ifMatchProblem(precondition.status);
 
     try {
-      const result = await addClassSubject(getDatabase(), route.data.classId, route.data.subjectId);
+      const result = await addClassSubject(getDatabase(), route.data.classId, route.data.subjectId,
+        precondition.value, { actorId: authorized.user.id, token: authorized.token });
       return result.status === "not-found"
         ? resourceNotFound()
-        : { status: 204, headers: { "cache-control": "no-store" } };
-    } catch {
+        : result.status === "class-closed"
+          ? classClosed()
+        : result.status === "stale"
+          ? ifMatchProblem("stale")
+          : { status: 204, headers: { "cache-control": "no-store", etag: result.etag } };
+    } catch (error) {
+      if (sessionWasRevoked(error)) return authenticationRequired();
       return internalFailure();
     }
   });
@@ -289,14 +353,20 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
     if (!route.success) return route.response;
     const authorized = await requireAdminSession(request, getDatabase);
     if (!authorized.authorized) return authorized.response;
+    const precondition = readIfMatch(request);
+    if (precondition.status !== "ok") return ifMatchProblem(precondition.status);
 
     try {
-      const result = await removeClassSubject(getDatabase(), route.data.classId, route.data.subjectId);
+      const result = await removeClassSubject(getDatabase(), route.data.classId, route.data.subjectId,
+        precondition.value, { actorId: authorized.user.id, token: authorized.token });
       if (result.status === "not-found") return resourceNotFound();
+      if (result.status === "class-closed") return classClosed();
+      if (result.status === "stale") return ifMatchProblem("stale");
       if (result.status === "completed-simulations") return completedSimulations();
       if (result.status === "has-simulation-results") return simulationResults();
-      return { status: 204, headers: { "cache-control": "no-store" } };
-    } catch {
+      return { status: 204, headers: { "cache-control": "no-store", etag: result.etag } };
+    } catch (error) {
+      if (sessionWasRevoked(error)) return authenticationRequired();
       return internalFailure();
     }
   });
@@ -307,7 +377,7 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
     getClass: detail,
     createClass: create,
     updateClass: update,
-    deleteClass: remove,
+    closeClass: close,
     listClassSubjects: listSubjects,
     addClassSubject: addSubject,
     removeClassSubject: removeSubject

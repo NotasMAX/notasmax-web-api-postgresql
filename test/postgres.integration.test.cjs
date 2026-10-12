@@ -9,13 +9,16 @@ const argon2 = require("argon2");
 const knexFactory = require("knex");
 const { Client } = require("pg");
 const { assertLoopbackHost } = require("../src/database/local-only.cjs");
+const { configurePostgresTimeZone } = require("../dist/database/postgres-timezone.js");
 const { createInitialAdmin } = require("../seed/admin.cjs");
 const { createAuthHandlers, requireAdminSession } = require("../dist/auth/handler.js");
 const { createAdminAccountHandlers } = require("../dist/auth/admin-account-handler.js");
 const { createAdminClassHandlers } = require("../dist/auth/admin-class-handler.js");
+const { createAdminEnrollmentHandlers } = require("../dist/auth/admin-enrollment-handler.js");
 const { createAdminSubjectHandlers } = require("../dist/auth/admin-subject-handler.js");
 const { createAccountLifecycleHandlers } = require("../dist/auth/account-lifecycle-handler.js");
-const { deleteAccount, updateAccount } = require("../dist/auth/admin-account-service.js");
+const { effectiveEnrollmentPredicate } = require("../dist/auth/effective-enrollment.js");
+const { updateAccount } = require("../dist/auth/admin-account-service.js");
 const {
   activateAccount,
   completePasswordReset,
@@ -63,7 +66,7 @@ function makeKnex(connection, pool = { min: 0, max: 2, acquireTimeoutMillis: 500
   return knexFactory({
     client: "pg",
     connection,
-    pool,
+    pool: { ...pool, afterCreate: configurePostgresTimeZone },
     migrations: { tableName: "knex_migrations", extension: "js" }
   });
 }
@@ -152,12 +155,31 @@ function accountLifecycleHandlers(database, emailTransport) {
 }
 
 function adminAccountHandlers(database, emailTransport) {
-  return createAdminAccountHandlers({
+  const base = createAdminAccountHandlers({
     getDatabase: () => database,
     allowedOrigins: [AUTH_ORIGIN],
     emailTransport,
     webBaseUrl: "https://web.example.test"
   });
+  const tagMutation = (handler) => async (request, context) => {
+    if (!request.headers.get("if-match") && request.headers.get("origin") === AUTH_ORIGIN
+      && request.headers.get("x-requested-with") === "XMLHttpRequest") {
+      const cookie = request.headers.get("cookie")?.match(/(?:^|;)\s*notasmax_session=([^;]+)/)?.[1];
+      const result = await base.listClassSubjectTeachers(accountRequest("GET", {
+        cookie, params: {
+          classId: request.params?.classId,
+          subjectId: request.params?.subjectId
+        }
+      }), context);
+      request.headers.set("if-match", result.headers?.etag || '""');
+    }
+    return handler(request, context);
+  };
+  return {
+    ...base,
+    addClassSubjectTeacher: tagMutation(base.addClassSubjectTeacher),
+    removeClassSubjectTeacher: tagMutation(base.removeClassSubjectTeacher)
+  };
 }
 
 function adminSubjectHandlers(database) {
@@ -168,10 +190,72 @@ function adminSubjectHandlers(database) {
 }
 
 function adminClassHandlers(database) {
-  return createAdminClassHandlers({
+  const base = createAdminClassHandlers({
     getDatabase: () => database,
     allowedOrigins: [AUTH_ORIGIN]
   });
+  const cookieFor = (request) => request.headers.get("cookie")?.match(/(?:^|;)\s*notasmax_session=([^;]+)/)?.[1];
+  const classMutation = (handler) => async (request, context) => {
+    if (!request.headers.get("if-match") && request.headers.get("origin") === AUTH_ORIGIN
+      && request.headers.get("x-requested-with") === "XMLHttpRequest") {
+      const result = await base.getClass(accountRequest("GET", {
+        cookie: cookieFor(request), params: { classId: request.params?.classId }
+      }), context);
+      request.headers.set("if-match", result.headers?.etag || '""');
+    }
+    return handler(request, context);
+  };
+  const subjectMutation = (handler) => async (request, context) => {
+    if (!request.headers.get("if-match") && request.headers.get("origin") === AUTH_ORIGIN
+      && request.headers.get("x-requested-with") === "XMLHttpRequest") {
+      const result = await base.listClassSubjects(accountRequest("GET", {
+        cookie: cookieFor(request), params: { classId: request.params?.classId }
+      }), context);
+      request.headers.set("if-match", result.headers?.etag || '""');
+    }
+    return handler(request, context);
+  };
+  return {
+    ...base,
+    updateClass: classMutation(base.updateClass),
+    closeClass: classMutation(base.closeClass),
+    addClassSubject: subjectMutation(base.addClassSubject),
+    removeClassSubject: subjectMutation(base.removeClassSubject)
+  };
+}
+
+function adminEnrollmentHandlers(database) {
+  const base = createAdminEnrollmentHandlers({
+    getDatabase: () => database,
+    allowedOrigins: [AUTH_ORIGIN]
+  });
+  const cookieFor = (request) => request.headers.get("cookie")?.match(/(?:^|;)\s*notasmax_session=([^;]+)/)?.[1];
+  return {
+    ...base,
+    cancelEnrollment: async (request, context) => {
+      if (!request.headers.get("if-match") && request.headers.get("origin") === AUTH_ORIGIN
+        && request.headers.get("x-requested-with") === "XMLHttpRequest") {
+        const result = await base.getEnrollment(accountRequest("GET", {
+          cookie: cookieFor(request), params: { enrollmentId: request.params?.enrollmentId }
+        }), context);
+        request.headers.set("if-match", result.headers?.etag || '""');
+      }
+      return base.cancelEnrollment(request, context);
+    },
+    createEnrollment: async (request, context) => {
+      if (!request.headers.get("if-match") && request.headers.get("origin") === AUTH_ORIGIN
+        && request.headers.get("x-requested-with") === "XMLHttpRequest") {
+        const body = await request.json();
+        if (body?.confirmPreviousEnrollmentId !== undefined) {
+          const result = await base.getEnrollment(accountRequest("GET", {
+            cookie: cookieFor(request), params: { enrollmentId: String(body.confirmPreviousEnrollmentId) }
+          }), context);
+          request.headers.set("if-match", result.headers?.etag || '""');
+        }
+      }
+      return base.createEnrollment(request, context);
+    }
+  };
 }
 
 let academicFixtureCounter = 0;
@@ -182,9 +266,13 @@ function nextSchoolYear() {
   return 1000000 + schoolYearFixtureCounter;
 }
 
-async function insertClass(database, { series = 1, schoolYear = nextSchoolYear() } = {}) {
+async function insertClass(database, { series = 1, schoolYear = nextSchoolYear(), startDate } = {}) {
   const [row] = await database("turma")
-    .insert({ serie: series, ano_letivo: schoolYear })
+    .insert({
+      serie: series,
+      ano_letivo: schoolYear,
+      inicio_em: startDate || database.raw("CURRENT_DATE - 1")
+    })
     .returning("id_turma");
   return String(row.id_turma);
 }
@@ -232,12 +320,14 @@ function accountRequest(method, {
   cookie,
   body,
   params,
-  query
+  query,
+  ifMatch
 } = {}) {
   const headers = new Headers();
   if (origin !== undefined) headers.set("origin", origin);
   if (requestedWith !== undefined) headers.set("x-requested-with", requestedWith);
   if (cookie !== undefined) headers.set("cookie", `notasmax_session=${cookie}`);
+  if (ifMatch !== undefined) headers.set("if-match", ifMatch);
   return { method, headers, params, query, json: async () => body };
 }
 
@@ -342,7 +432,21 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       extension: "js"
     });
     assert.equal(batch, 1);
-    assert.equal(migrations.length, 5);
+    assert.equal(migrations.length, 6);
+
+    for (const connection of [database, secondConnection]) {
+      const timeZone = await connection.raw("SELECT current_setting('TimeZone') AS time_zone");
+      assert.equal(timeZone.rows[0].time_zone, "America/Sao_Paulo");
+    }
+    const midnightBoundary = await database.raw(`
+      SELECT
+        (TIMESTAMPTZ '2026-01-01 02:59:59+00')::date::text AS before_local_midnight,
+        (TIMESTAMPTZ '2026-01-01 03:00:00+00')::date::text AS after_local_midnight
+    `);
+    assert.deepEqual(midnightBoundary.rows[0], {
+      before_local_midnight: "2025-12-31",
+      after_local_midnight: "2026-01-01"
+    });
 
     await t.test("admin login creates hash-only session, rotates it on login, and logout revokes it", async () => {
       const account = await insertAuthAdministrator(database);
@@ -1040,381 +1144,97 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.ok(await database("token_ativacao").where({ id_usuario: validCleanupId }).first());
     });
 
-    await t.test("administrative account CRUD reuses activation, reauthentication, and logical-delete rules", async () => {
-      const administrator = await insertAuthAdministrator(database, { email: newIdentity("account-crud-admin") });
+    await t.test("administrative account creation and updates work while retired DELETEs are static 404s", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("account-admin") });
       const adminToken = await insertAuthSession(database, administrator.id);
-      const outbox = [];
-      let verifyEmailTransitionAtSend;
-      const handlers = adminAccountHandlers(database, {
-        async send(message) {
-          outbox.push(message);
-          await verifyEmailTransitionAtSend?.(message);
-        }
-      });
-      const createdStudentEmail = newIdentity("api-created-student");
-      const createdStudent = await handlers.createStudent(accountRequest("POST", {
+      const sent = [];
+      const handlers = adminAccountHandlers(database, { async send(message) { sent.push(message); } });
+      const logs = [];
+      const context = { invocationId: "synthetic-account-management", log(message) { logs.push(message); } };
+
+      const studentEmail = newIdentity("managed-student");
+      const created = await handlers.createStudent(accountRequest("POST", {
         cookie: adminToken,
         body: {
-          name: "Synthetic API Student",
-          email: createdStudentEmail,
-          contactPhone: "+5511999990011",
-          guardianPhone: "+5511999990022"
+          name: "Synthetic Managed Student",
+          email: studentEmail,
+          guardianPhone: "+5511999990000"
         }
-      }), {});
-      assert.equal(createdStudent.status, 201);
-      assert.deepEqual(createdStudent.jsonBody, { activationEmailStatus: "sent" });
-      assert.equal(outbox.length, 1);
-      const studentToken = new URL(outbox[0].url).searchParams.get("token");
-      assert.ok(studentToken);
-      const createdStudentRow = await database("usuario")
-        .where({ email_institucional: createdStudentEmail })
-        .first();
-      assert.equal(createdStudentRow.tipo_perfil, "aluno");
-      assert.equal(createdStudentRow.ativado_em, null);
-      assert.equal(createdStudentRow.hash_senha, null);
-      assert.ok(await database("aluno").where({ id_usuario: createdStudentRow.id_usuario }).first());
-      const persistedActivation = await database("token_ativacao")
-        .where({ id_usuario: createdStudentRow.id_usuario })
-        .first();
-      assert.equal(persistedActivation.hash_token_sha256.equals(hashOpaqueToken(studentToken)), true);
-      assert.equal(JSON.stringify(createdStudent).includes(studentToken), false);
-      assert.equal(JSON.stringify(createdStudent).includes(createdStudentEmail), false);
+      }), context);
+      assert.equal(created.status, 201);
+      assert.deepEqual(created.jsonBody, { activationEmailStatus: "sent" });
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].kind, "activation");
+      assert.equal(sent[0].recipient, studentEmail);
+      const student = await database("usuario").where({
+        tipo_perfil: "aluno", email_institucional: studentEmail
+      }).first();
+      assert.ok(student);
+      assert.equal(student.ativado_em, null);
+      assert.ok(await database("aluno").where({ id_usuario: student.id_usuario }).first());
 
-      const teacherEmail = newIdentity("api-created-teacher");
-      const createdTeacher = await handlers.createTeacher(accountRequest("POST", {
+      const detail = await handlers.getStudent(accountRequest("GET", {
+        cookie: adminToken, params: { studentId: String(student.id_usuario) }
+      }), context);
+      assert.equal(detail.status, 200);
+      assert.equal(detail.jsonBody.guardianPhone, "+5511999990000");
+      const updated = await handlers.updateStudent(accountRequest("PATCH", {
         cookie: adminToken,
-        body: { name: "Synthetic API Teacher", email: teacherEmail }
-      }), {});
-      assert.equal(createdTeacher.status, 201);
-      assert.deepEqual(createdTeacher.jsonBody, { activationEmailStatus: "sent" });
-      const teacherRow = await database("usuario").where({ email_institucional: teacherEmail }).first();
-      assert.equal(teacherRow.tipo_perfil, "professor");
-      assert.ok(await database("professor").where({ id_usuario: teacherRow.id_usuario }).first());
+        params: { studentId: String(student.id_usuario) },
+        body: { name: "Synthetic Updated Student", contactPhone: "+5511988880000", guardianPhone: "+5511977770000" }
+      }), context);
+      assert.equal(updated.status, 200);
+      assert.equal(updated.jsonBody.name, "Synthetic Updated Student");
+      assert.equal(updated.jsonBody.contactPhone, "+5511988880000");
+      assert.equal(updated.jsonBody.guardianPhone, "+5511977770000");
 
-      const administratorEmail = newIdentity("api-created-admin");
-      const createdAdministrator = await handlers.createAdministrator(accountRequest("POST", {
-        cookie: adminToken,
-        body: { name: "Synthetic API Administrator", email: administratorEmail }
-      }), {});
-      assert.equal(createdAdministrator.status, 201);
-      assert.deepEqual(createdAdministrator.jsonBody, { activationEmailStatus: "sent" });
-      const pendingAdministrator = await database("usuario")
-        .where({ email_institucional: administratorEmail })
-        .first();
-      assert.equal(pendingAdministrator.tipo_perfil, "administrador");
-      assert.equal(pendingAdministrator.ativado_em, null);
-
-      const studentList = await handlers.listStudents(accountRequest("GET", {
-        cookie: adminToken,
-        query: new URLSearchParams({
-          search: "synthetic api student",
-          activationStatus: "pending",
-          enrollmentStatus: "no_active_enrollment",
-          page: "1",
-          pageSize: "10"
-        })
-      }), {});
-      assert.equal(studentList.status, 200);
-      assert.deepEqual(studentList.jsonBody.pagination, {
-        page: 1, pageSize: 10, totalItems: 1, totalPages: 1
-      });
-      assert.equal(studentList.jsonBody.items[0].studentId, String(createdStudentRow.id_usuario));
-      assert.equal(studentList.jsonBody.items[0].currentClass, null);
-      assert.equal(studentList.jsonBody.items[0].enrollmentStatus, "no_active_enrollment");
-
-      const studentDetail = await handlers.getStudent(accountRequest("GET", {
-        cookie: adminToken,
-        params: { studentId: String(createdStudentRow.id_usuario) }
-      }), {});
-      assert.equal(studentDetail.status, 200);
-      assert.equal(studentDetail.jsonBody.guardianPhone, "+5511999990022");
-      assert.equal(studentDetail.jsonBody.enrollments.length, 0);
-      const teacherList = await handlers.listTeachers(accountRequest("GET", {
-        cookie: adminToken,
-        query: new URLSearchParams({ search: "synthetic api teacher" })
-      }), {});
-      assert.equal(teacherList.status, 200);
-      assert.equal(teacherList.jsonBody.items[0].teacherId, String(teacherRow.id_usuario));
-      assert.equal((await handlers.getTeacher(accountRequest("GET", {
-        cookie: adminToken,
-        params: { teacherId: String(teacherRow.id_usuario) }
-      }), {})).jsonBody.activationStatus, "pending");
-      const administratorList = await handlers.listAdministrators(accountRequest("GET", {
-        cookie: adminToken,
-        query: new URLSearchParams({ search: "synthetic api administrator" })
-      }), {});
-      assert.equal(administratorList.status, 200);
-      assert.equal(administratorList.jsonBody.items[0].administratorId, String(pendingAdministrator.id_usuario));
-      assert.equal((await handlers.getAdministrator(accountRequest("GET", {
-        cookie: adminToken,
-        params: { administratorId: String(pendingAdministrator.id_usuario) }
-      }), {})).jsonBody.activationStatus, "pending");
-      const deletePendingAdministrator = await handlers.deleteAdministrator(accountRequest("DELETE", {
-        cookie: adminToken,
-        params: { administratorId: String(pendingAdministrator.id_usuario) }
-      }), {});
-      assert.equal(deletePendingAdministrator.status, 204);
-      assert.ok((await database("usuario").where({ id_usuario: pendingAdministrator.id_usuario }).first()).excluido_em);
-
-      const nonAdminId = await insertStudent(database, newIdentity("account-non-admin"));
-      const nonAdminToken = await insertAuthSession(database, nonAdminId);
-      assertProblemResponse(await handlers.listStudents(accountRequest("GET", {
-        cookie: nonAdminToken,
-        query: new URLSearchParams()
-      }), {}), 404, "RESOURCE_NOT_FOUND");
-      assert.equal(JSON.stringify(await handlers.getStudent(accountRequest("GET", {
-        cookie: "A".repeat(43),
-        params: { studentId: String(createdStudentRow.id_usuario) }
-      }), {})).includes(createdStudentEmail), false);
-
-      const invalid = await handlers.createTeacher(accountRequest("POST", {
-        cookie: adminToken,
-        body: { name: " ", email: "private-invalid-email@example.test" }
-      }), {});
-      assertProblemResponse(invalid, 422, "VALIDATION_ERROR");
-      assert.equal(JSON.stringify(invalid).includes("private-invalid-email"), false);
-      const duplicate = await handlers.createTeacher(accountRequest("POST", {
-        cookie: adminToken,
-        body: { name: "Synthetic Duplicate Teacher", email: teacherEmail }
-      }), {});
-      assertProblemResponse(duplicate, 409, "EMAIL_ALREADY_IN_USE");
-      assert.equal(JSON.stringify(duplicate).includes(teacherEmail), false);
-
-      const renamed = await handlers.updateStudent(accountRequest("PATCH", {
-        cookie: adminToken,
-        params: { studentId: String(createdStudentRow.id_usuario) },
-        body: { name: "Synthetic Updated Student", contactPhone: null }
-      }), {});
-      assert.equal(renamed.status, 200);
-      assert.equal(renamed.jsonBody.name, "Synthetic Updated Student");
-      assert.equal(Object.hasOwn(renamed.jsonBody, "contactPhone"), false);
-
-      const changeTargetEmail = newIdentity("email-change-current");
-      const changeTargetId = await insertStudent(database, changeTargetEmail);
-      const previousPasswordHash = await syntheticPasswordHash("synthetic-previous-student-password");
-      await database("usuario").where({ id_usuario: changeTargetId }).update({ hash_senha: previousPasswordHash });
-      const previousSession = await insertAuthSession(database, changeTargetId);
-      const newEmail = newIdentity("email-change-confirmed");
-      const missingReauthentication = await handlers.updateStudent(accountRequest("PATCH", {
-        cookie: adminToken,
-        params: { studentId: String(changeTargetId) },
-        body: { email: newEmail }
-      }), {});
-      assertProblemResponse(missingReauthentication, 422, "VALIDATION_ERROR");
-      assert.deepEqual(missingReauthentication.jsonBody.errors[0].source, {
-        in: "body",
-        pointer: "/currentPassword"
-      });
-      assert.equal((await database("usuario").where({ id_usuario: changeTargetId }).first()).email_pendente, null);
-      let transitionObservedAtSend = false;
-      verifyEmailTransitionAtSend = async (message) => {
-        if (message.kind !== "activation" || message.recipient !== newEmail) return;
-        const accountAtSend = await database("usuario").where({ id_usuario: changeTargetId }).first();
-        assert.equal(accountAtSend.email_institucional, changeTargetEmail);
-        assert.equal(accountAtSend.email_pendente, newEmail);
-        assert.equal(accountAtSend.ativado_em, null);
-        const token = new URL(message.url).searchParams.get("token");
-        const tokenRow = await database("token_ativacao").where({ id_usuario: changeTargetId }).first();
-        assert.ok(tokenRow);
-        assert.equal(tokenRow.hash_token_sha256.equals(hashOpaqueToken(token)), true);
-        transitionObservedAtSend = true;
-      };
-      const emailChange = await handlers.updateStudent(accountRequest("PATCH", {
-        cookie: adminToken,
-        params: { studentId: String(changeTargetId) },
-        body: { email: newEmail, currentPassword: administrator.password }
-      }), {});
-      assert.equal(emailChange.status, 200);
-      const pendingEmailAccount = await database("usuario").where({ id_usuario: changeTargetId }).first();
-      assert.equal(pendingEmailAccount.email_institucional, changeTargetEmail);
-      assert.equal(pendingEmailAccount.email_pendente, newEmail);
-      assert.equal(pendingEmailAccount.ativado_em, null);
-      assert.equal(pendingEmailAccount.hash_senha, previousPasswordHash);
-      assert.equal(transitionObservedAtSend, true);
-      assert.deepEqual(outbox.slice(-2).map((message) => [message.kind, message.recipient]), [
-        ["activation", newEmail],
-        ["email-change-notice", changeTargetEmail]
-      ]);
-      const activationForNewEmail = outbox.at(-2);
-      const changeToken = new URL(activationForNewEmail.url).searchParams.get("token");
-      const changeTokenRow = await database("token_ativacao").where({ id_usuario: changeTargetId }).first();
-      assert.equal(changeTokenRow.hash_token_sha256.equals(hashOpaqueToken(changeToken)), true);
-      for (const secret of [newEmail, changeToken, administrator.password, previousPasswordHash]) {
-        assert.equal(JSON.stringify(emailChange).includes(secret), false);
+      const teacherId = await insertProfessor(database);
+      const accountEventsBeforeDeletes = [...logs];
+      const beforeUsers = await database("usuario").select("id_usuario", "tipo_perfil", "excluido_em").orderBy("id_usuario");
+      const beforeSessions = await database("sessao").select("id_sessao", "id_usuario", "revogada_em").orderBy("id_sessao");
+      const beforeEnrollments = await database("matricula").count({ count: "id_matricula" }).first();
+      const queries = [];
+      const listener = (query) => queries.push(query.sql);
+      database.on("query", listener);
+      let responses;
+      try {
+        responses = await Promise.all([
+          handlers.deleteStudent(accountRequest("DELETE", {
+            origin: "https://attacker.example.test", params: { studentId: String(student.id_usuario) }
+          }), context),
+          handlers.deleteStudent(accountRequest("DELETE", {
+            params: { studentId: "9223372036854775807" }
+          }), context),
+          handlers.deleteTeacher(accountRequest("DELETE", {
+            params: { teacherId: String(teacherId) }
+          }), context),
+          handlers.deleteTeacher(accountRequest("DELETE", {
+            params: { teacherId: "0" }
+          }), context),
+          handlers.deleteAdministrator(accountRequest("DELETE", {
+            params: { administratorId: String(administrator.id) }
+          }), context),
+          handlers.deleteAdministrator(accountRequest("DELETE", {
+            params: { administratorId: "999999" }
+          }), context)
+        ]);
+      } finally {
+        database.removeListener("query", listener);
       }
-
-      const lifecycle = accountLifecycleHandlers(database, { async send() {} });
-      const activated = await lifecycle.activate(accountRequest("POST", {
-        body: { token: changeToken, password: "synthetic-reactivated-account-password" }
-      }), {});
-      assert.equal(activated.status, 200);
-      const confirmedEmailAccount = await database("usuario").where({ id_usuario: changeTargetId }).first();
-      assert.equal(confirmedEmailAccount.email_institucional, newEmail);
-      assert.equal(confirmedEmailAccount.email_pendente, null);
-      assert.ok(confirmedEmailAccount.ativado_em);
-      assert.equal(await argon2.verify(confirmedEmailAccount.hash_senha, "synthetic-reactivated-account-password"), true);
-      const revokedEmailChangeSession = await database("sessao")
-        .where({ hash_token_sha256: createHash("sha256").update(previousSession).digest() })
-        .first();
-      assert.ok(revokedEmailChangeSession.revogada_em);
-      assert.equal(JSON.stringify(activated).includes(changeToken), false);
-
-      const duplicateEmailChange = await handlers.updateStudent(accountRequest("PATCH", {
-        cookie: adminToken,
-        params: { studentId: String(changeTargetId) },
-        body: { email: teacherEmail, currentPassword: administrator.password }
-      }), {});
-      assertProblemResponse(duplicateEmailChange, 409, "EMAIL_ALREADY_IN_USE");
-      const afterDuplicate = await database("usuario").where({ id_usuario: changeTargetId }).first();
-      assert.equal(afterDuplicate.email_institucional, newEmail);
-      assert.equal(afterDuplicate.email_pendente, null);
-
-      const createFailureEmail = newIdentity("email-failure-account");
-      const failedDeliveryHandlers = adminAccountHandlers(database, {
-        async send() { throw new Error("synthetic-provider-stack-private"); }
-      });
-      const failedDelivery = await failedDeliveryHandlers.createAdministrator(accountRequest("POST", {
-        cookie: adminToken,
-        body: { name: "Synthetic Delivery Failure", email: createFailureEmail }
-      }), {});
-      assert.equal(failedDelivery.status, 201);
-      assert.deepEqual(failedDelivery.jsonBody, { activationEmailStatus: "failed" });
-      assert.ok(await database("usuario").where({ email_institucional: createFailureEmail }).first());
-      assert.equal(JSON.stringify(failedDelivery).includes("synthetic-provider-stack-private"), false);
-
-      const activeEnrollmentClass = (await database("turma").insert({ serie: 1, ano_letivo: 2097 }).returning("id_turma"))[0].id_turma;
-      const blockedStudentId = await insertStudent(database, newIdentity("student-delete-blocked"));
-      await database("matricula").insert({
-        id_usuario_aluno: blockedStudentId,
-        id_turma: activeEnrollmentClass,
-        inicio_vigencia: "2097-01-01"
-      });
-      const completedSimulation = (await database("simulado").insert({
-        id_turma: activeEnrollmentClass,
-        numero: 1,
-        tipo: "objetivo",
-        bimestre: 1,
-        data_realizacao: "2097-02-01",
-        instante_confirmacao_realizacao: database.raw("clock_timestamp()")
-      }).returning("id_simulado"))[0].id_simulado;
-      await database("simulado_aluno").insert({
-        id_simulado: completedSimulation,
-        id_usuario_aluno: blockedStudentId
-      });
-      const activeStudentsByClass = await handlers.listStudents(accountRequest("GET", {
-        cookie: adminToken,
-        query: new URLSearchParams({
-          classId: String(activeEnrollmentClass),
-          enrollmentStatus: "active",
-          activationStatus: "activated"
-        })
-      }), {});
-      const blockedStudentItem = activeStudentsByClass.jsonBody.items
-        .find((item) => item.studentId === String(blockedStudentId));
-      assert.ok(blockedStudentItem);
-      assert.equal(blockedStudentItem.currentClass.schoolYear, 2097);
-      assert.ok(blockedStudentItem.enrollmentId);
-      const blockedStudentDetail = await handlers.getStudent(accountRequest("GET", {
-        cookie: adminToken,
-        params: { studentId: String(blockedStudentId) }
-      }), {});
-      assert.equal(blockedStudentDetail.jsonBody.enrollments.length, 1);
-      assert.equal(blockedStudentDetail.jsonBody.enrollmentStatus, "active");
-      const blockedDelete = await handlers.deleteStudent(accountRequest("DELETE", {
-        cookie: adminToken,
-        params: { studentId: String(blockedStudentId) }
-      }), {});
-      assertProblemResponse(blockedDelete, 409, "STUDENT_CANNOT_BE_DELETED");
-
-      const unblockedStudentId = await insertStudent(database, newIdentity("student-delete-allowed"));
-      await database("matricula").insert({
-        id_usuario_aluno: unblockedStudentId,
-        id_turma: activeEnrollmentClass,
-        inicio_vigencia: "2097-01-01"
-      });
-      const unblockedSession = await insertAuthSession(database, unblockedStudentId);
-      const unblockedDelete = await handlers.deleteStudent(accountRequest("DELETE", {
-        cookie: adminToken,
-        params: { studentId: String(unblockedStudentId) }
-      }), {});
-      assert.equal(unblockedDelete.status, 204);
-      assert.equal(unblockedDelete.jsonBody, undefined);
-      const deletedStudent = await database("usuario").where({ id_usuario: unblockedStudentId }).first();
-      assert.ok(deletedStudent.excluido_em);
-      const deletedStudentSession = await database("sessao")
-        .where({ hash_token_sha256: createHash("sha256").update(unblockedSession).digest() })
-        .first();
-      assert.ok(deletedStudentSession.revogada_em);
-
-      const linkedTeacherId = await insertProfessor(database, newIdentity("teacher-delete-linked"));
-      const subjectId = (await database("materia").insert({ nome: "Synthetic Teacher Filter Subject" }).returning("id_materia"))[0].id_materia;
-      const offerId = (await database("turma_disciplina").insert({
-        id_turma: activeEnrollmentClass,
-        id_materia: subjectId
-      }).returning("id_turma_disciplina"))[0].id_turma_disciplina;
-      await database("turma_disciplina_professor").insert({
-        id_turma_disciplina: offerId,
-        id_usuario_professor: linkedTeacherId
-      });
-      const filteredTeachers = await handlers.listTeachers(accountRequest("GET", {
-        cookie: adminToken,
-        query: new URLSearchParams({
-          classId: String(activeEnrollmentClass),
-          subjectId: String(subjectId),
-          search: "teacher-delete-linked"
-        })
-      }), {});
-      assert.equal(filteredTeachers.status, 200);
-      assert.deepEqual(filteredTeachers.jsonBody.items.map((item) => item.teacherId), [String(linkedTeacherId)]);
-      const linkedTeacherDelete = await handlers.deleteTeacher(accountRequest("DELETE", {
-        cookie: adminToken,
-        params: { teacherId: String(linkedTeacherId) }
-      }), {});
-      assertProblemResponse(linkedTeacherDelete, 409, "TEACHER_HAS_LINKED_DATA");
-      await database("turma_disciplina_professor").where({
-        id_turma_disciplina: offerId,
-        id_usuario_professor: linkedTeacherId
-      }).delete();
-      assert.equal((await handlers.deleteTeacher(accountRequest("DELETE", {
-        cookie: adminToken,
-        params: { teacherId: String(linkedTeacherId) }
-      }), {})).status, 204);
-
-      const selfDelete = await handlers.deleteAdministrator(accountRequest("DELETE", {
-        cookie: adminToken,
-        params: { administratorId: String(administrator.id) }
-      }), {});
-      assertProblemResponse(selfDelete, 409, "ADMINISTRATOR_CANNOT_DELETE_SELF");
-
-      const failedAttemptsBefore = outbox.length;
-      const lockedTargetId = createdStudentRow.id_usuario;
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        assertProblemResponse(await handlers.updateStudent(accountRequest("PATCH", {
-          cookie: adminToken,
-          params: { studentId: String(lockedTargetId) },
-          body: { email: newIdentity("locked-reauth-email"), currentPassword: "synthetic-wrong-admin-password" }
-        }), {}), 401, "AUTHENTICATION_FAILED");
-      }
-      const lockedAccount = await database("usuario").where({ id_usuario: administrator.id }).first();
-      assert.equal(lockedAccount.falhas_login_na_janela, 5);
-      assert.ok(lockedAccount.bloqueado_ate);
-      assertProblemResponse(await handlers.updateStudent(accountRequest("PATCH", {
-        cookie: adminToken,
-        params: { studentId: String(lockedTargetId) },
-        body: { email: newIdentity("blocked-reauth-email"), currentPassword: administrator.password }
-      }), {}), 401, "AUTHENTICATION_FAILED");
-      const untouchedTarget = await database("usuario").where({ id_usuario: lockedTargetId }).first();
-      assert.equal(untouchedTarget.email_pendente, null);
-      assert.equal(outbox.length, failedAttemptsBefore);
+      for (const response of responses) assertProblemResponse(response, 404, "RESOURCE_NOT_FOUND");
+      for (const response of responses.slice(1)) assert.deepEqual(response, responses[0]);
+      assert.deepEqual(queries, []);
+      assert.deepEqual(await database("usuario").select("id_usuario", "tipo_perfil", "excluido_em").orderBy("id_usuario"), beforeUsers);
+      assert.deepEqual(await database("sessao").select("id_sessao", "id_usuario", "revogada_em").orderBy("id_sessao"), beforeSessions);
+      assert.equal(Number((await database("matricula").count({ count: "id_matricula" }).first()).count),
+        Number(beforeEnrollments.count));
+      assert.deepEqual(logs, accountEventsBeforeDeletes);
     });
-
     await t.test("teacher associations are authorized, scoped, idempotent, and preserve teacher accounts", async () => {
       const administrator = await insertAuthAdministrator(database, { email: newIdentity("association-admin") });
       const adminToken = await insertAuthSession(database, administrator.id);
-      const classId = (await database("turma").insert({ serie: 1, ano_letivo: 2091 })
-        .returning("id_turma"))[0].id_turma;
-      const otherClassId = (await database("turma").insert({ serie: 2, ano_letivo: 2091 })
-        .returning("id_turma"))[0].id_turma;
+      const classId = await insertClass(database, { series: 1, schoolYear: 2091 });
+      const otherClassId = await insertClass(database, { series: 2, schoolYear: 2091 });
       const subjectId = (await database("materia").insert({ nome: newIdentity("association-subject") })
         .returning("id_materia"))[0].id_materia;
       const offerId = (await database("turma_disciplina").insert({
@@ -1526,7 +1346,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       const linkedDelete = await handlers.deleteTeacher(accountRequest("DELETE", {
         cookie: adminToken, params: { teacherId: String(firstTeacherId) }
       }), context);
-      assertProblemResponse(linkedDelete, 409, "TEACHER_HAS_LINKED_DATA");
+      assertProblemResponse(linkedDelete, 404, "RESOURCE_NOT_FOUND");
 
       const removeOne = await handlers.removeClassSubjectTeacher(accountRequest("DELETE", {
         cookie: adminToken, params: route(firstTeacherId)
@@ -1541,20 +1361,20 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
         id_usuario_professor: firstTeacherId
       }).first(), undefined);
       assert.ok(await database("professor").where({ id_usuario: firstTeacherId }).first());
-      assert.equal((await handlers.deleteTeacher(accountRequest("DELETE", {
+      assertProblemResponse(await handlers.deleteTeacher(accountRequest("DELETE", {
         cookie: adminToken, params: { teacherId: String(firstTeacherId) }
-      }), context)).status, 204);
+      }), context), 404, "RESOURCE_NOT_FOUND");
 
       const deletedTeacherAdd = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
         cookie: adminToken, params: route(firstTeacherId)
       }), context);
-      assertProblemResponse(deletedTeacherAdd, 404, "RESOURCE_NOT_FOUND");
+      assert.equal(deletedTeacherAdd.status, 204);
       const remaining = await handlers.listClassSubjectTeachers(accountRequest("GET", {
         cookie: adminToken,
         params: { classId: String(classId), subjectId: String(subjectId) }
       }), context);
       assert.deepEqual(remaining.jsonBody.items.map((item) => item.teacherId).sort((a, b) => Number(a) - Number(b)),
-        [String(secondTeacherId), String(pendingTeacherId)].sort((a, b) => Number(a) - Number(b)));
+        [String(firstTeacherId), String(secondTeacherId), String(pendingTeacherId)].sort((a, b) => Number(a) - Number(b)));
 
       const logsParsed = logs.map((line) => JSON.parse(line));
       assert.ok(logsParsed.some((entry) => entry.event === "admin_teacher_association_add"));
@@ -1570,59 +1390,50 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       }), "23503");
     });
 
-    await t.test("teacher association and deletion serialize without leaving a deleted teacher linked", async () => {
+    await t.test("revocation wins over a teacher association waiting on the affected identity", async () => {
       const administrator = await insertAuthAdministrator(database, { email: newIdentity("association-race-admin") });
       const adminToken = await insertAuthSession(database, administrator.id);
-      const concurrentAdminToken = await insertAuthSession(database, administrator.id);
-      const classId = (await database("turma").insert({ serie: 3, ano_letivo: 2092 })
-        .returning("id_turma"))[0].id_turma;
+      const classId = await insertClass(database, { series: 3, schoolYear: 2092 });
       const subjectId = (await database("materia").insert({ nome: newIdentity("association-race-subject") })
         .returning("id_materia"))[0].id_materia;
       await database("turma_disciplina").insert({ id_turma: classId, id_materia: subjectId });
       const teacherId = await insertProfessor(database, newIdentity("association-race-teacher"));
+      const teacherToken = await insertAuthSession(database, teacherId);
       const testConnection = connectionFromEnvironment(generatedDatabase);
-      const deletionApplication = `nm-association-delete-${process.pid}`;
       const associationApplication = `nm-association-put-${process.pid}`;
-      const deletionConnection = makeKnex({ ...testConnection, application_name: deletionApplication }, {
-        min: 1, max: 1, acquireTimeoutMillis: 5000
-      });
       const associationConnection = makeKnex({ ...testConnection, application_name: associationApplication }, {
         min: 1, max: 1, acquireTimeoutMillis: 5000
       });
       const blocker = await database.transaction();
-      let deletePromise;
       let addPromise;
 
       try {
-        await deletionConnection.raw("SELECT 1");
         await associationConnection.raw("SELECT 1");
-        await blocker("professor").select("id_usuario").where({ id_usuario: teacherId }).forUpdate().first();
+        await blocker("usuario").select("id_usuario").where({ id_usuario: teacherId }).forUpdate().first();
 
-        const deletionHandlers = adminAccountHandlers(deletionConnection, { async send() {} });
         const associationHandlers = adminAccountHandlers(associationConnection, { async send() {} });
-        deletePromise = deletionHandlers.deleteTeacher(accountRequest("DELETE", {
-          cookie: adminToken, params: { teacherId: String(teacherId) }
-        }), {});
-        await waitForLockWait(database, deletionApplication);
-
         addPromise = associationHandlers.addClassSubjectTeacher(accountRequest("PUT", {
-          cookie: concurrentAdminToken,
+          cookie: adminToken,
           params: { classId: String(classId), subjectId: String(subjectId), teacherId: String(teacherId) }
         }), {});
         await waitForLockWait(database, associationApplication);
 
+        await database("sessao")
+          .where({ hash_token_sha256: hashOpaqueToken(adminToken) })
+          .update({ revogada_em: database.raw("clock_timestamp()") });
         await blocker.commit();
-        const [deleted, associated] = await Promise.all([deletePromise, addPromise]);
-        assert.equal(deleted.status, 204);
-        assertProblemResponse(associated, 404, "RESOURCE_NOT_FOUND");
-        assert.ok((await database("usuario").where({ id_usuario: teacherId }).first()).excluido_em);
+        const associated = await addPromise;
+        assertProblemResponse(associated, 401, "AUTHENTICATION_REQUIRED");
         assert.equal(await database("turma_disciplina_professor").where({
           id_usuario_professor: teacherId
         }).first(), undefined);
+        assert.equal((await database("usuario").where({ id_usuario: teacherId }).first()).excluido_em, null);
+        assert.equal((await database("sessao").where({ hash_token_sha256: hashOpaqueToken(teacherToken) }).first())
+          .revogada_em, null);
       } finally {
         if (!blocker.isCompleted()) await blocker.rollback();
-        await Promise.allSettled([deletePromise, addPromise].filter(Boolean));
-        await Promise.all([deletionConnection.destroy(), associationConnection.destroy()]);
+        await Promise.allSettled([addPromise].filter(Boolean));
+        await associationConnection.destroy();
       }
     });
 
@@ -1811,11 +1622,16 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       }), context);
       assertProblemResponse(rejectedReauthentication, 401, "AUTHENTICATION_FAILED");
 
-      const deleted = await handlers.deleteTeacher(accountRequest("DELETE", {
+      const retiredDelete = await handlers.deleteTeacher(accountRequest("DELETE", {
         cookie: adminToken,
         params: { teacherId: String(teacherId) }
       }), context);
-      assert.equal(deleted.status, 204);
+      assertProblemResponse(retiredDelete, 404, "RESOURCE_NOT_FOUND");
+      const missingRetiredDelete = await handlers.deleteTeacher(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { teacherId: "9223372036854775807" }
+      }), context);
+      assert.deepEqual(missingRetiredDelete, retiredDelete);
 
       const loggerFailure = await handlers.updateStudent(accountRequest("PATCH", {
         cookie: adminToken,
@@ -1839,7 +1655,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.ok(records.some((record) => record.event === "admin_account_create" && record.result === "completed"));
       assert.ok(records.some((record) => record.event === "admin_account_update" && record.result === "completed"));
       assert.ok(records.some((record) => record.event === "admin_account_update" && record.result === "rejected"));
-      assert.ok(records.some((record) => record.event === "admin_account_delete" && record.result === "completed"));
+      assert.equal(records.some((record) => record.event === "admin_account_delete"), false);
       assert.ok(records.some((record) => record.event === "admin_account_reauthentication" && record.result === "completed"));
       assert.ok(records.some((record) => record.event === "admin_account_reauthentication" && record.result === "rejected"));
 
@@ -1861,7 +1677,9 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       for (const secret of logSensitiveValues) {
         assert.equal(loggedStringValues.some((value) => value.includes(secret)), false);
       }
-      const serializedResponses = JSON.stringify([created, updated, rejectedReauthentication, deleted, loggerFailure]);
+      const serializedResponses = JSON.stringify([
+        created, updated, rejectedReauthentication, retiredDelete, missingRetiredDelete, loggerFailure
+      ]);
       const responseSecrets = [
         administrator.password,
         administrator.passwordHash,
@@ -2041,9 +1859,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
         .where({ id_materia: second.jsonBody.subjectId }).first("nome");
       assert.equal(unchangedDuplicateTarget.nome, `${prefix} Beta`);
 
-      const classId = (await database("turma")
-        .insert({ serie: 1, ano_letivo: 2500 + (process.pid % 1000) })
-        .returning("id_turma"))[0].id_turma;
+      const classId = await insertClass(database, { series: 1, schoolYear: 2500 + (process.pid % 1000) });
       await database("turma_disciplina").insert({
         id_turma: classId,
         id_materia: second.jsonBody.subjectId
@@ -2148,322 +1964,886 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       }
     });
 
-    await t.test("administrative classes enforce active uniqueness, link rules, and current-year queries", async () => {
+    await t.test("class lifecycle, ETags, atomic selected closures, and session revocation follow the approved contract", async () => {
       const administrator = await insertAuthAdministrator(database, { email: newIdentity("class-admin") });
       const adminToken = await insertAuthSession(database, administrator.id);
       const handlers = adminClassHandlers(database);
-      const classLogs = [];
-      const context = {
-        invocationId: "synthetic-class-invocation",
-        log(message) { classLogs.push(message); }
-      };
-      const currentYear = new Date().getUTCFullYear();
+      const logs = [];
+      const context = { invocationId: "synthetic-class-lifecycle", log(message) { logs.push(message); } };
+      const dates = await database.raw("SELECT EXTRACT(YEAR FROM CURRENT_DATE)::int AS calendar_year, CURRENT_DATE::text AS today, (CURRENT_DATE - 1)::text AS yesterday, (CURRENT_DATE + 1)::text AS tomorrow");
+      const { calendar_year: calendarYear, today, yesterday, tomorrow } = dates.rows[0];
+      const latestStoredYear = await database("turma").max({ school_year: "ano_letivo" }).first();
+      const currentYear = Math.max(calendarYear, Number(latestStoredYear.school_year || 0) + 2);
 
       const first = await handlers.createClass(accountRequest("POST", {
-        cookie: adminToken, body: { series: 2, schoolYear: currentYear }
+        cookie: adminToken, body: { series: 2, schoolYear: currentYear, startDate: today }
       }), context);
-      const second = await handlers.createClass(accountRequest("POST", {
-        cookie: adminToken, body: { series: 3, schoolYear: currentYear }
+      const future = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken, body: { series: 3, schoolYear: currentYear, startDate: tomorrow }
       }), context);
       const older = await handlers.createClass(accountRequest("POST", {
-        cookie: adminToken, body: { series: 1, schoolYear: currentYear - 1 }
+        cookie: adminToken, body: { series: 1, schoolYear: currentYear - 1, startDate: yesterday }
       }), context);
-      for (const response of [first, second, older]) assert.equal(response.status, 201);
-      assert.deepEqual(Object.keys(first.jsonBody).sort(), ["classId", "schoolYear", "series"]);
-      assert.equal(first.jsonBody.series, 2);
-      assert.equal(first.jsonBody.schoolYear, currentYear);
+      for (const response of [first, future, older]) assert.equal(response.status, 201);
+      assert.deepEqual(Object.keys(first.jsonBody).sort(), ["classId", "schoolYear", "series", "startDate"]);
+      assert.equal(first.jsonBody.startDate, today);
+      assert.match(first.headers.etag, /^"[A-Za-z0-9_-]+"$/);
 
       const duplicate = await handlers.createClass(accountRequest("POST", {
-        cookie: adminToken, body: { series: 2, schoolYear: currentYear }
+        cookie: adminToken, body: { series: 3, schoolYear: currentYear, startDate: today }
       }), context);
       assertProblemResponse(duplicate, 409, "CLASS_ALREADY_EXISTS");
 
       const defaultPage = await handlers.listClasses(accountRequest("GET", {
         cookie: adminToken, query: new URLSearchParams()
       }), context);
-      assert.equal(defaultPage.status, 200);
       assert.deepEqual(defaultPage.jsonBody.pagination, {
         page: 1, pageSize: 20, totalItems: 2, totalPages: 1
       });
-      assert.ok(defaultPage.jsonBody.items.every((item) => item.schoolYear === currentYear));
       assert.deepEqual(defaultPage.jsonBody.items.map((item) => item.series), [2, 3]);
-      const filteredPage = await handlers.listClasses(accountRequest("GET", {
+      assert.equal(defaultPage.jsonBody.items.every((item) => item.schoolYear === currentYear), true);
+      const filtered = await handlers.listClasses(accountRequest("GET", {
         cookie: adminToken,
-        query: new URLSearchParams(`schoolYear=${currentYear - 1}&page=1&pageSize=1`)
+        query: new URLSearchParams("schoolYear=" + (currentYear - 1) + "&page=1&pageSize=1")
       }), context);
-      assert.deepEqual(filteredPage.jsonBody.pagination, {
-        page: 1, pageSize: 1, totalItems: 1, totalPages: 1
-      });
-      assert.deepEqual(filteredPage.jsonBody.items, [older.jsonBody]);
+      assert.deepEqual(filtered.jsonBody.items, [older.jsonBody]);
 
       const detail = await handlers.getClass(accountRequest("GET", {
         cookie: adminToken, params: { classId: first.jsonBody.classId }
       }), context);
       assert.deepEqual(detail.jsonBody, first.jsonBody);
-      const missingDetail = await handlers.getClass(accountRequest("GET", {
-        cookie: adminToken, params: { classId: "9223372036854775807" }
+      assert.match(detail.headers.etag, /^"[A-Za-z0-9_-]+"$/);
+      const classRow = () => database("turma").where({ id_turma: first.jsonBody.classId }).first();
+
+      const noOp = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken, params: { classId: first.jsonBody.classId },
+        ifMatch: detail.headers.etag, body: { series: 2 }
       }), context);
-      assertProblemResponse(missingDetail, 404, "CLASS_NOT_FOUND");
+      assert.equal(noOp.status, 200);
+      assert.equal(noOp.headers.etag, detail.headers.etag);
+      assert.equal(Number((await classRow()).version), 1);
 
       const duplicateUpdate = await handlers.updateClass(accountRequest("PATCH", {
-        cookie: adminToken,
-        params: { classId: second.jsonBody.classId },
-        body: { series: 2 }
+        cookie: adminToken, params: { classId: future.jsonBody.classId }, body: { series: 2 }
       }), context);
       assertProblemResponse(duplicateUpdate, 409, "CLASS_ALREADY_EXISTS");
 
       const updated = await handlers.updateClass(accountRequest("PATCH", {
-        cookie: adminToken,
-        params: { classId: first.jsonBody.classId },
-        body: { series: 1 }
+        cookie: adminToken, params: { classId: first.jsonBody.classId }, body: { series: 1 }
       }), context);
       assert.equal(updated.status, 200);
       assert.deepEqual(updated.jsonBody, {
-        classId: first.jsonBody.classId, series: 1, schoolYear: currentYear
+        classId: first.jsonBody.classId, series: 1, schoolYear: currentYear, startDate: today
       });
-      assert.equal((await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: first.jsonBody.classId }
-      }), context)).status, 204);
+      assert.notEqual(updated.headers.etag, detail.headers.etag);
+      const staleUpdate = await handlers.updateClass(accountRequest("PATCH", {
+        cookie: adminToken, params: { classId: first.jsonBody.classId },
+        ifMatch: detail.headers.etag, body: { series: 2 }
+      }), context);
+      assert.equal(staleUpdate.status, 412);
 
-      const concurrentYear = nextSchoolYear();
-      const concurrentClassCreates = await Promise.all([
-        handlers.createClass(accountRequest("POST", {
-          cookie: adminToken, body: { series: 1, schoolYear: concurrentYear }
-        }), context),
-        adminClassHandlers(secondConnection).createClass(accountRequest("POST", {
-          cookie: adminToken, body: { series: 1, schoolYear: concurrentYear }
-        }), context)
-      ]);
-      assert.equal(concurrentClassCreates.filter((response) => response.status === 201).length, 1);
-      assert.equal(concurrentClassCreates.filter((response) => response.status === 409).length, 1);
-      assert.equal(concurrentClassCreates.find((response) => response.status === 409).jsonBody.code, "CLASS_ALREADY_EXISTS");
+      const rawHandlers = createAdminClassHandlers({ getDatabase: () => database, allowedOrigins: [AUTH_ORIGIN] });
+      const missingIfMatch = await rawHandlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: future.jsonBody.classId }
+      }), context);
+      assert.equal(missingIfMatch.status, 428);
+      for (const invalidTag of ["*", "W/\"weak\"", "\"one\", \"two\""]) {
+        const invalid = await rawHandlers.closeClass(accountRequest("POST", {
+          cookie: adminToken, params: { classId: future.jsonBody.classId }, ifMatch: invalidTag
+        }), context);
+        assert.equal(invalid.status, 400);
+      }
+
+      const futureTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: future.jsonBody.classId }
+      }), context)).headers.etag;
+      const futureClose = await handlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: future.jsonBody.classId }, ifMatch: futureTag
+      }), context);
+      assert.equal(futureClose.status, 204, "closing before start is allowed");
+      const closedFutureRepresentation = await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: future.jsonBody.classId }
+      }), context);
+      assert.equal(futureClose.headers.etag, closedFutureRepresentation.headers.etag);
+      assert.notEqual(futureClose.headers.etag, futureTag);
+      const closedFuture = await database("turma").where({ id_turma: future.jsonBody.classId }).first();
+      assert.ok(closedFuture.fechada_em);
+      assert.equal(Number(closedFuture.version), 2);
+      assert.equal((await handlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: future.jsonBody.classId }, ifMatch: futureTag
+      }), context)).status, 412);
+      const currentFutureTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: future.jsonBody.classId }
+      }), context)).headers.etag;
+      const alreadyClosed = await handlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: future.jsonBody.classId }, ifMatch: currentFutureTag
+      }), context);
+      assert.equal(alreadyClosed.status, 204);
+      assert.equal(alreadyClosed.headers.etag, currentFutureTag);
+      assert.equal(Number((await database("turma").where({ id_turma: future.jsonBody.classId }).first()).version), 2);
+
+      const selectedSourceId = await insertClass(database, {
+        series: 2, schoolYear: currentYear + 100, startDate: yesterday
+      });
+      const selectedStudentId = await insertStudent(database);
+      const selectedStudentToken = await insertAuthSession(database, selectedStudentId);
+      await database("matricula").insert({
+        id_usuario_aluno: selectedStudentId, id_turma: selectedSourceId,
+        inicio_vigencia: yesterday, fim_vigencia: null, cancelada_em: null
+      });
+      const selected = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken,
+        body: {
+          series: 2,
+          schoolYear: currentYear + 101,
+          startDate: today,
+          closeClassIds: [{ classId: selectedSourceId, expectedVersion: 1 }]
+        }
+      }), context);
+      assert.equal(selected.status, 201);
+      assert.equal(selected.jsonBody.schoolYear, currentYear + 101);
+      const closedSource = await database("turma").where({ id_turma: selectedSourceId }).first();
+      assert.ok(closedSource.fechada_em);
+      assert.equal(Number(closedSource.version), 2);
+      const selectedStudentSession = await database("sessao")
+        .where({ id_usuario: selectedStudentId }).first();
+      assert.ok(selectedStudentSession.revogada_em);
+      assert.ok(selectedStudentToken);
+
+      const rollbackSourceId = await insertClass(database, {
+        series: 1, schoolYear: currentYear + 300, startDate: today
+      });
+      const classCountBefore = Number((await database("turma").count({ count: "id_turma" }).first()).count);
+      const selectionError = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken,
+        body: {
+          series: 1,
+          schoolYear: currentYear + 301,
+          startDate: today,
+          closeClassIds: [
+            { classId: rollbackSourceId, expectedVersion: 1 },
+            { classId: "9223372036854775807", expectedVersion: 1 }
+          ]
+        }
+      }), context);
+      const selectionProblem = assertProblemResponse(selectionError, 409, "CLASS_SELECTION_INVALID");
+      assert.deepEqual(selectionProblem.errors[0].source, { in: "body", pointer: "/closeClassIds" });
+      assert.equal(Number((await database("turma").count({ count: "id_turma" }).first()).count), classCountBefore);
+      assert.equal((await database("turma").where({ id_turma: rollbackSourceId }).first()).fechada_em, null);
+
+      const staleSelection = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken,
+        body: {
+          series: 2,
+          schoolYear: currentYear + 101,
+          startDate: today,
+          closeClassIds: [{ classId: selectedSourceId, expectedVersion: 1 }]
+        }
+      }), context);
+      assertProblemResponse(staleSelection, 409, "CLASS_SELECTION_INVALID");
 
       const linkedClassId = await insertClass(database);
       const linkedSubjectId = await insertSubject(database);
       const [linkedOffer] = await database("turma_disciplina")
         .insert({ id_turma: linkedClassId, id_materia: linkedSubjectId })
         .returning("id_turma_disciplina");
-      const linkedDelete = await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: linkedClassId }
-      }), context);
-      assertProblemResponse(linkedDelete, 409, "CLASS_HAS_LINKED_DATA");
       const linkedEdit = await handlers.updateClass(accountRequest("PATCH", {
         cookie: adminToken, params: { classId: linkedClassId }, body: { schoolYear: nextSchoolYear() }
       }), context);
       assertProblemResponse(linkedEdit, 409, "CLASS_HAS_LINKED_DATA");
-      await assert.rejects(
-        database("turma").where({ id_turma: linkedClassId }).delete(),
-        (error) => error.constraint === "turma_disciplina_id_turma_fkey"
-      );
-      assert.equal(await database("turma_disciplina").where({ id_turma_disciplina: linkedOffer.id_turma_disciplina }).first() !== undefined, true);
-
-      const activeEnrollmentClass = await insertClass(database);
-      const activeStudentId = await insertStudent(database);
-      await database("matricula").insert({
-        id_usuario_aluno: activeStudentId,
-        id_turma: activeEnrollmentClass,
-        inicio_vigencia: database.raw("CURRENT_DATE"),
-        fim_vigencia: null,
-        cancelada_em: null
-      });
-      const enrollmentBlocked = await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: activeEnrollmentClass }
-      }), context);
-      assertProblemResponse(enrollmentBlocked, 409, "CLASS_HAS_LINKED_DATA");
-      const enrollmentEditBlocked = await handlers.updateClass(accountRequest("PATCH", {
-        cookie: adminToken, params: { classId: activeEnrollmentClass }, body: { series: 2 }
-      }), context);
-      assertProblemResponse(enrollmentEditBlocked, 409, "CLASS_HAS_LINKED_DATA");
-      await database("matricula").where({ id_turma: activeEnrollmentClass }).update({
-        cancelada_em: database.raw("clock_timestamp()")
-      });
-      const cancelledEnrollmentEdit = await handlers.updateClass(accountRequest("PATCH", {
-        cookie: adminToken, params: { classId: activeEnrollmentClass }, body: { schoolYear: nextSchoolYear() }
-      }), context);
-      assertProblemResponse(cancelledEnrollmentEdit, 409, "CLASS_HAS_LINKED_DATA");
-      const cancelledEnrollmentDelete = await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: activeEnrollmentClass }
-      }), context);
-      assert.equal(cancelledEnrollmentDelete.status, 204);
-
-      const endedEnrollmentClass = await insertClass(database);
-      const endedStudentId = await insertStudent(database);
-      await database("matricula").insert({
-        id_usuario_aluno: endedStudentId,
-        id_turma: endedEnrollmentClass,
-        inicio_vigencia: database.raw("CURRENT_DATE - 30"),
-        fim_vigencia: database.raw("CURRENT_DATE - 1"),
-        cancelada_em: null
-      });
-      const endedEnrollmentEdit = await handlers.updateClass(accountRequest("PATCH", {
-        cookie: adminToken, params: { classId: endedEnrollmentClass }, body: { series: 2 }
-      }), context);
-      assertProblemResponse(endedEnrollmentEdit, 409, "CLASS_HAS_LINKED_DATA");
-      const endedEnrollmentDelete = await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: endedEnrollmentClass }
-      }), context);
-      assert.equal(endedEnrollmentDelete.status, 204);
-
-      const activeSimulationClass = await insertClass(database);
-      const activeSimulation = await insertSimulation(database, activeSimulationClass, { date: "1999-01-01" });
-      const activeSimulationDelete = await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: activeSimulationClass }
-      }), context);
-      assertProblemResponse(activeSimulationDelete, 409, "CLASS_HAS_LINKED_DATA");
-      await database("simulado").where({ id_simulado: activeSimulation }).update({
-        excluido_em: database.raw("clock_timestamp()")
-      });
-      const cancelledSimulationEdit = await handlers.updateClass(accountRequest("PATCH", {
-        cookie: adminToken, params: { classId: activeSimulationClass }, body: { schoolYear: nextSchoolYear() }
-      }), context);
-      assertProblemResponse(cancelledSimulationEdit, 409, "CLASS_HAS_LINKED_DATA");
-      const cancelledSimulationDelete = await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: activeSimulationClass }
-      }), context);
-      assert.equal(cancelledSimulationDelete.status, 204);
-
-      const confirmedSimulationClass = await insertClass(database);
-      await insertSimulation(database, confirmedSimulationClass, {
-        confirmed: true, date: "2099-12-31"
-      });
-      const confirmedSimulationDelete = await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: confirmedSimulationClass }
-      }), context);
-      assert.equal(confirmedSimulationDelete.status, 204);
-
-      const uniqueSimulationClass = await insertClass(database);
-      const uniqueSimulation = await insertSimulation(database, uniqueSimulationClass, {
-        confirmed: true, date: "2099-12-31"
-      });
-      const confirmedSimulationEdit = await handlers.updateClass(accountRequest("PATCH", {
-        cookie: adminToken, params: { classId: uniqueSimulationClass }, body: { schoolYear: nextSchoolYear() }
-      }), context);
-      assertProblemResponse(confirmedSimulationEdit, 409, "CLASS_HAS_LINKED_DATA");
-      assert.equal((await database("simulado").where({ id_simulado: uniqueSimulation }).first()) !== undefined, true);
-
-      const raceClassId = await insertClass(database);
-      const raceSubjectId = await insertSubject(database);
-      const workerApplication = `phase02-class-worker-${process.pid}`;
-      const monitor = makeKnex({
-        ...connectionFromEnvironment(generatedDatabase),
-        application_name: `phase02-class-monitor-${process.pid}`
-      });
-      const worker = makeKnex({ ...targetConnection, application_name: workerApplication });
-      let releaseClassBlocker;
-      let signalClassLocked;
-      const classLocked = new Promise((resolve) => { signalClassLocked = resolve; });
-      const continueClassBlocker = new Promise((resolve) => { releaseClassBlocker = resolve; });
-      const classBlockerTransaction = database.transaction(async (transaction) => {
-        await transaction("turma").where({ id_turma: raceClassId }).forUpdate().first();
-        signalClassLocked();
-        await continueClassBlocker;
-        await transaction("turma_disciplina").insert({
-          id_turma: raceClassId,
-          id_materia: raceSubjectId
-        });
-      });
-      try {
-        await classLocked;
-        const workerHandlers = adminClassHandlers(worker);
-        const pendingClassDelete = workerHandlers.deleteClass(accountRequest("DELETE", {
-          cookie: adminToken, params: { classId: raceClassId }
-        }), context);
-        await waitForLockWait(monitor, workerApplication);
-        releaseClassBlocker();
-        await classBlockerTransaction;
-        assertProblemResponse(await pendingClassDelete, 409, "CLASS_HAS_LINKED_DATA");
-        assert.equal(await database("turma").where({ id_turma: raceClassId }).whereNull("excluido_em").first() !== undefined, true);
-        assert.equal(await database("turma_disciplina").where({
-          id_turma: raceClassId, id_materia: raceSubjectId
-        }).first() !== undefined, true);
-      } finally {
-        releaseClassBlocker();
-        await classBlockerTransaction.catch(() => undefined);
-        await Promise.all([monitor.destroy(), worker.destroy()]);
-      }
-
-      const cancelledOnlyYear = nextSchoolYear();
-      const reusableClass = await handlers.createClass(accountRequest("POST", {
-        cookie: adminToken, body: { series: 1, schoolYear: cancelledOnlyYear }
-      }), context);
-      assert.equal(reusableClass.status, 201);
-      assert.equal((await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: reusableClass.jsonBody.classId }
+      const linkedTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: linkedClassId }
+      }), context)).headers.etag;
+      assert.equal((await handlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: linkedClassId }, ifMatch: linkedTag
       }), context)).status, 204);
-      assert.equal((await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: reusableClass.jsonBody.classId }
-      }), context)).status, 204);
-      const deletedDetail = await handlers.getClass(accountRequest("GET", {
-        cookie: adminToken, params: { classId: reusableClass.jsonBody.classId }
-      }), context);
-      assertProblemResponse(deletedDetail, 404, "CLASS_NOT_FOUND");
-      const reused = await handlers.createClass(accountRequest("POST", {
-        cookie: adminToken, body: { series: 1, schoolYear: cancelledOnlyYear }
-      }), context);
-      assert.equal(reused.status, 201);
-      assert.notEqual(reused.jsonBody.classId, reusableClass.jsonBody.classId);
-      const years = await handlers.listClassYears(accountRequest("GET", { cookie: adminToken }), context);
-      const yearValues = years.jsonBody.items.map((item) => item.schoolYear);
-      assert.equal(yearValues.includes(cancelledOnlyYear), true);
-      assert.equal(yearValues.filter((value) => value === currentYear).length, 1);
-      assert.deepEqual(yearValues, [...yearValues].sort((left, right) => right - left));
-      const removedOnlyYear = nextSchoolYear();
-      const temporaryYearClass = await handlers.createClass(accountRequest("POST", {
-        cookie: adminToken, body: { series: 2, schoolYear: removedOnlyYear }
-      }), context);
-      assert.equal(temporaryYearClass.status, 201);
-      assert.equal((await handlers.deleteClass(accountRequest("DELETE", {
-        cookie: adminToken, params: { classId: temporaryYearClass.jsonBody.classId }
-      }), context)).status, 204);
-      const yearsAfterDelete = await handlers.listClassYears(accountRequest("GET", { cookie: adminToken }), context);
-      assert.equal(yearsAfterDelete.jsonBody.items.some((item) => item.schoolYear === removedOnlyYear), false);
+      assert.equal(await database("turma_disciplina")
+        .where({ id_turma_disciplina: linkedOffer.id_turma_disciplina }).first() !== undefined, true);
 
-      const studentId = await insertStudent(database, newIdentity("class-non-admin"));
-      const studentToken = await insertAuthSession(database, studentId);
+      const concurrentYear = currentYear + 400;
+      const concurrentCreates = await Promise.all([
+        handlers.createClass(accountRequest("POST", {
+          cookie: adminToken, body: { series: 1, schoolYear: concurrentYear, startDate: today }
+        }), context),
+        adminClassHandlers(secondConnection).createClass(accountRequest("POST", {
+          cookie: adminToken, body: { series: 1, schoolYear: concurrentYear, startDate: today }
+        }), context)
+      ]);
+      assert.equal(concurrentCreates.filter((response) => response.status === 201).length, 1);
+      assert.equal(concurrentCreates.filter((response) => response.status === 409).length, 1);
+
+      const nonAdminId = await insertStudent(database, newIdentity("class-non-admin"));
+      const nonAdminToken = await insertAuthSession(database, nonAdminId);
       const queries = [];
-      const queryListener = (query) => queries.push(query.sql);
-      database.on("query", queryListener);
+      const listener = (query) => queries.push(query.sql);
+      database.on("query", listener);
       try {
         const denied = await Promise.all([
-          handlers.listClasses(accountRequest("GET", {
-            cookie: studentToken, query: new URLSearchParams()
-          }), context),
-          handlers.listClassYears(accountRequest("GET", { cookie: studentToken }), context),
+          handlers.listClasses(accountRequest("GET", { cookie: nonAdminToken, query: new URLSearchParams() }), context),
+          handlers.listClassYears(accountRequest("GET", { cookie: nonAdminToken }), context),
           handlers.getClass(accountRequest("GET", {
-            cookie: studentToken, params: { classId: first.jsonBody.classId }
+            cookie: nonAdminToken, params: { classId: first.jsonBody.classId }
           }), context),
           handlers.createClass(accountRequest("POST", {
-            cookie: studentToken, body: { series: 1, schoolYear: nextSchoolYear() }
+            cookie: nonAdminToken,
+            body: { series: 1, schoolYear: currentYear + 500, startDate: today }
           }), context),
           handlers.updateClass(accountRequest("PATCH", {
-            cookie: studentToken, params: { classId: first.jsonBody.classId }, body: { series: 2 }
+            cookie: nonAdminToken, params: { classId: first.jsonBody.classId }, body: { series: 2 }
           }), context),
-          handlers.deleteClass(accountRequest("DELETE", {
-            cookie: studentToken, params: { classId: first.jsonBody.classId }
-          }), context),
-          handlers.listClassSubjects(accountRequest("GET", {
-            cookie: studentToken, params: { classId: linkedClassId }
+          handlers.closeClass(accountRequest("POST", {
+            cookie: nonAdminToken, params: { classId: first.jsonBody.classId }
           }), context),
           handlers.addClassSubject(accountRequest("PUT", {
-            cookie: studentToken, params: { classId: linkedClassId, subjectId: linkedSubjectId }
+            cookie: nonAdminToken, params: { classId: linkedClassId, subjectId: linkedSubjectId }
           }), context),
           handlers.removeClassSubject(accountRequest("DELETE", {
-            cookie: studentToken, params: { classId: linkedClassId, subjectId: linkedSubjectId }
+            cookie: nonAdminToken, params: { classId: linkedClassId, subjectId: linkedSubjectId }
           }), context)
         ]);
         for (const response of denied) assertProblemResponse(response, 404, "RESOURCE_NOT_FOUND");
       } finally {
-        database.removeListener("query", queryListener);
+        database.removeListener("query", listener);
       }
       assert.equal(queries.some((sql) => /\b(?:FROM|JOIN|INTO|UPDATE|DELETE\s+FROM)\s+"?(?:turma|turma_disciplina|materia|matricula|simulado)\b/i.test(sql)), false);
-      const records = classLogs.map((line) => JSON.parse(line));
+      assert.equal(handlers.deleteClass, undefined);
+      const records = logs.map((line) => JSON.parse(line));
       assert.ok(records.some((record) => record.event === "admin_class_create" && record.result === "completed"));
       assert.ok(records.some((record) => record.event === "admin_class_update" && record.result === "completed"));
-      assert.ok(records.some((record) => record.event === "admin_class_delete" && record.result === "rejected"));
-      assert.ok(records.some((record) => record.event === "admin_class_delete" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_class_close" && record.result === "completed"));
+    });
+    await t.test("student status derives eligibility from half-open dates and open classes", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("enrollment-view-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const accountHandlers = adminAccountHandlers(database, { async send() {} });
+      const classHandlers = adminClassHandlers(database);
+      const dates = await database.raw("SELECT CURRENT_DATE::text AS today, (CURRENT_DATE - 1)::text AS yesterday, (CURRENT_DATE + 1)::text AS tomorrow");
+      const { today, yesterday, tomorrow } = dates.rows[0];
+      const context = { invocationId: "synthetic-enrollment-view", log() {} };
+
+      const futureClassId = await insertClass(database);
+      const futureStudentId = await insertStudent(database);
+      const [futureEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: futureStudentId,
+        id_turma: futureClassId,
+        inicio_vigencia: tomorrow,
+        fim_vigencia: null,
+        cancelada_em: null
+      }).returning("id_matricula");
+      const futureList = await accountHandlers.listStudents(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams("classId=" + futureClassId + "&enrollmentStatus=active")
+      }), context);
+      assert.equal(futureList.jsonBody.pagination.totalItems, 0);
+      const futureDetail = await accountHandlers.getStudent(accountRequest("GET", {
+        cookie: adminToken, params: { studentId: String(futureStudentId) }
+      }), context);
+      assert.equal(futureDetail.jsonBody.enrollmentStatus, "no_active_enrollment");
+      assert.equal(futureDetail.jsonBody.currentClass, null);
+      assert.equal(futureDetail.jsonBody.enrollments[0].enrollmentId, String(futureEnrollment.id_matricula));
+
+      const futureTag = (await classHandlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: futureClassId }
+      }), context)).headers.etag;
+      assert.equal((await classHandlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: futureClassId }, ifMatch: futureTag
+      }), context)).status, 204);
+      assert.equal((await database("matricula").where({ id_matricula: futureEnrollment.id_matricula }).first()).fim_vigencia, null);
+      assert.equal((await accountHandlers.getStudent(accountRequest("GET", {
+        cookie: adminToken, params: { studentId: String(futureStudentId) }
+      }), context)).jsonBody.enrollmentStatus, "no_active_enrollment");
+
+      const scheduledClassId = await insertClass(database);
+      const scheduledStudentId = await insertStudent(database);
+      const [scheduledEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: scheduledStudentId,
+        id_turma: scheduledClassId,
+        inicio_vigencia: yesterday,
+        fim_vigencia: tomorrow,
+        cancelada_em: database.raw("clock_timestamp()")
+      }).returning("id_matricula");
+      const scheduledList = await accountHandlers.listStudents(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams("classId=" + scheduledClassId + "&enrollmentStatus=active")
+      }), context);
+      assert.equal(scheduledList.jsonBody.pagination.totalItems, 1);
+      assert.equal(scheduledList.jsonBody.items[0].enrollmentId, String(scheduledEnrollment.id_matricula));
+      const scheduledTag = (await classHandlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: scheduledClassId }
+      }), context)).headers.etag;
+      assert.equal((await classHandlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: scheduledClassId }, ifMatch: scheduledTag
+      }), context)).status, 204);
+      const scheduledDetail = await accountHandlers.getStudent(accountRequest("GET", {
+        cookie: adminToken, params: { studentId: String(scheduledStudentId) }
+      }), context);
+      assert.equal(scheduledDetail.jsonBody.enrollmentStatus, "no_active_enrollment");
+      assert.equal(scheduledDetail.jsonBody.enrollments[0].cancellationDate, tomorrow);
+
+      const boundaryClassId = await insertClass(database);
+      const boundaryStudentId = await insertStudent(database);
+      const [boundaryEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: boundaryStudentId,
+        id_turma: boundaryClassId,
+        inicio_vigencia: yesterday,
+        fim_vigencia: today,
+        cancelada_em: null
+      }).returning("id_matricula");
+      const effectiveYesterday = await database("matricula as m")
+        .select("m.id_matricula")
+        .where("m.id_matricula", boundaryEnrollment.id_matricula)
+        .whereRaw(effectiveEnrollmentPredicate("m", "?::date"), [yesterday, yesterday])
+        .first();
+      const effectiveOnEndDate = await database("matricula as m")
+        .select("m.id_matricula")
+        .where("m.id_matricula", boundaryEnrollment.id_matricula)
+        .whereRaw(effectiveEnrollmentPredicate("m", "?::date"), [today, today])
+        .first();
+      assert.ok(effectiveYesterday);
+      assert.equal(effectiveOnEndDate, undefined);
+      const boundaryTag = (await classHandlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: boundaryClassId }
+      }), context)).headers.etag;
+      assert.equal((await classHandlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: boundaryClassId }, ifMatch: boundaryTag
+      }), context)).status, 204);
+      assert.equal(await database("matricula").where({ id_matricula: boundaryEnrollment.id_matricula }).first() !== undefined, true);
+    });
+    await t.test("enrollment creation and renewal validate, serialize, and roll back atomically", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("enrollment-create-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const handlers = adminEnrollmentHandlers(database);
+      const secondHandlers = adminEnrollmentHandlers(secondConnection);
+      const dates = await database.raw(`
+        SELECT CURRENT_DATE::text AS today,
+          (CURRENT_DATE - 1)::text AS yesterday,
+          (CURRENT_DATE + 1)::text AS tomorrow,
+          (CURRENT_DATE + 2)::text AS day_after_tomorrow
+      `);
+      const { today, yesterday, tomorrow, day_after_tomorrow: dayAfterTomorrow } = dates.rows[0];
+      const logs = [];
+      const context = { invocationId: "synthetic-enrollment-create", log(message) { logs.push(message); } };
+      const createFor = (studentId, classId, startDate, confirmPreviousEnrollmentId, targetHandlers = handlers) => {
+        const body = { studentId: String(studentId), startDate };
+        if (confirmPreviousEnrollmentId !== undefined) {
+          body.confirmPreviousEnrollmentId = String(confirmPreviousEnrollmentId);
+        }
+        return targetHandlers.createEnrollment(accountRequest("POST", {
+          cookie: adminToken,
+          params: { classId: String(classId) },
+          body
+        }), context);
+      };
+      const countStudentEnrollments = async (studentId) => {
+        const row = await database("matricula").where({ id_usuario_aluno: studentId })
+          .count({ count: "id_matricula" }).first();
+        return Number(row.count);
+      };
+
+      const pendingStudent = await insertPendingStudent(database);
+      const futureClass = await insertClass(database, { schoolYear: 1900000000 });
+      const pastDate = await createFor(pendingStudent, futureClass, yesterday);
+      assertProblemResponse(pastDate, 422, "VALIDATION_ERROR");
+      assert.equal(await countStudentEnrollments(pendingStudent), 0);
+
+      const created = await createFor(pendingStudent, futureClass, tomorrow);
+      assert.equal(created.status, 201);
+      assert.deepEqual(Object.keys(created.jsonBody), ["enrollmentId"]);
+      assert.match(created.jsonBody.enrollmentId, /^[1-9]\d*$/);
+      const createdRow = await database("matricula")
+        .select("id_turma", database.raw("inicio_vigencia::text AS inicio_vigencia"), "fim_vigencia")
+        .where({ id_matricula: created.jsonBody.enrollmentId, id_usuario_aluno: pendingStudent }).first();
+      assert.equal(String(createdRow.id_turma), futureClass);
+      assert.equal(createdRow.inicio_vigencia, tomorrow);
+      assert.equal(createdRow.fim_vigencia, null);
+      assert.equal(await database("matricula as m")
+        .where("m.id_matricula", created.jsonBody.enrollmentId)
+        .whereRaw(effectiveEnrollmentPredicate("m"))
+        .first(), undefined, "a future enrollment is not effective today");
+      assert.ok(await database("matricula as m")
+        .where("m.id_matricula", created.jsonBody.enrollmentId)
+        .whereRaw(effectiveEnrollmentPredicate("m", "?::date"), [tomorrow, tomorrow])
+        .first(), "the enrollment becomes effective on its start date");
+      assertProblemResponse(await createFor(pendingStudent, futureClass, tomorrow), 409, "ENROLLMENT_ALREADY_ACTIVE");
+      assert.equal(await countStudentEnrollments(pendingStudent), 1, "a repeated POST does not create a duplicate");
+
+      const sameYearStudent = await insertStudent(database);
+      const sameYearSourceClass = await insertClass(database, { series: 1, schoolYear: 1900000010 });
+      const sameYearTargetClass = await insertClass(database, { series: 2, schoolYear: 1900000010 });
+      await database("matricula").insert({
+        id_usuario_aluno: sameYearStudent,
+        id_turma: sameYearSourceClass,
+        inicio_vigencia: yesterday
+      });
+      assertProblemResponse(await createFor(sameYearStudent, sameYearTargetClass, today),
+        409, "ENROLLMENT_ALREADY_ACTIVE");
+      assert.equal(await countStudentEnrollments(sameYearStudent), 1);
+
+      const otherYearStudent = await insertStudent(database);
+      const otherYearSourceClass = await insertClass(database, { schoolYear: 1900000018 });
+      const otherYearTargetClass = await insertClass(database, { schoolYear: 1900000020 });
+      await database("matricula").insert({
+        id_usuario_aluno: otherYearStudent,
+        id_turma: otherYearSourceClass,
+        inicio_vigencia: yesterday
+      });
+      assertProblemResponse(await createFor(otherYearStudent, otherYearTargetClass, today),
+        409, "ENROLLMENT_ALREADY_ACTIVE");
+      assert.equal(await countStudentEnrollments(otherYearStudent), 1);
+
+      const deletedStudent = await insertStudent(database);
+      const deletedStudentClass = await insertClass(database, { schoolYear: 1900000030 });
+      await database("usuario").where({ id_usuario: deletedStudent }).update({
+        excluido_em: database.raw("clock_timestamp()")
+      });
+      assertProblemResponse(await createFor(deletedStudent, deletedStudentClass, today),
+        404, "STUDENT_NOT_FOUND");
+      const missingClassStudent = await insertStudent(database);
+      assertProblemResponse(await createFor(missingClassStudent, "9223372036854775807", today), 404, "CLASS_NOT_FOUND");
+
+      const renewalStudent = await insertPendingStudent(database);
+      const renewalYear = 1900000040;
+      const previousClass = await insertClass(database, { schoolYear: renewalYear - 1 });
+      const renewalClass = await insertClass(database, { schoolYear: renewalYear });
+      const [previousEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: renewalStudent,
+        id_turma: previousClass,
+        inicio_vigencia: tomorrow
+      }).returning("id_matricula");
+      assert.equal(await database("matricula as m")
+        .where("m.id_matricula", previousEnrollment.id_matricula)
+        .whereRaw(effectiveEnrollmentPredicate("m"))
+        .first(), undefined, "the preceding-year enrollment is not active today");
+
+      const firstRenewal = await createFor(renewalStudent, renewalClass, dayAfterTomorrow);
+      assertProblemResponse(firstRenewal, 409, "PREVIOUS_YEAR_ENROLLMENT_CONFIRMATION_REQUIRED");
+      assert.equal(firstRenewal.jsonBody.previousEnrollmentId, String(previousEnrollment.id_matricula));
+      assert.equal(await countStudentEnrollments(renewalStudent), 1);
+      assert.equal((await database("matricula").where({ id_matricula: previousEnrollment.id_matricula }).first()).fim_vigencia,
+        null, "the first request makes no writes");
+
+      const confirmedRenewal = await createFor(renewalStudent, renewalClass, dayAfterTomorrow,
+        previousEnrollment.id_matricula);
+      assert.equal(confirmedRenewal.status, 201);
+      assert.deepEqual(Object.keys(confirmedRenewal.jsonBody), ["enrollmentId"]);
+      assert.match(confirmedRenewal.jsonBody.enrollmentId, /^[1-9]\d*$/);
+      const renewedPrevious = await database("matricula")
+        .select(database.raw("fim_vigencia::text AS fim_vigencia"), "cancelada_em")
+        .where({ id_matricula: previousEnrollment.id_matricula }).first();
+      assert.equal(renewedPrevious.fim_vigencia, dayAfterTomorrow);
+      assert.equal(renewedPrevious.cancelada_em, null);
+      const newRenewal = await database("matricula")
+        .select("id_turma", database.raw("inicio_vigencia::text AS inicio_vigencia"))
+        .where({ id_matricula: confirmedRenewal.jsonBody.enrollmentId }).first();
+      assert.equal(String(newRenewal.id_turma), renewalClass);
+      assert.equal(newRenewal.inicio_vigencia, dayAfterTomorrow);
+      assert.equal(await countStudentEnrollments(renewalStudent), 2);
+      const retroactiveResults = await database("resultado").where({ id_turma: renewalClass })
+        .count("* as count").first();
+      assert.equal(Number(retroactiveResults.count), 0, "renewal does not create retroactive results");
+      assertProblemResponse(await createFor(renewalStudent, renewalClass, dayAfterTomorrow,
+        previousEnrollment.id_matricula), 409, "ENROLLMENT_ALREADY_ACTIVE");
+      assert.equal(await countStudentEnrollments(renewalStudent), 2,
+        "retrying a completed confirmation does not create another enrollment");
+
+      const exactStartStudent = await insertStudent(database);
+      const [exactStartPrevious] = await database("matricula").insert({
+        id_usuario_aluno: exactStartStudent,
+        id_turma: previousClass,
+        inicio_vigencia: tomorrow
+      }).returning("id_matricula");
+      const exactStartFirstRequest = await createFor(exactStartStudent, renewalClass, tomorrow);
+      assertProblemResponse(exactStartFirstRequest, 409, "PREVIOUS_YEAR_ENROLLMENT_CANNOT_BE_RENEWED");
+      assert.equal(Object.hasOwn(exactStartFirstRequest.jsonBody, "previousEnrollmentId"), false,
+        "the blocked exact boundary does not request confirmation");
+      const exactStartConfirmedRequest = await createFor(
+        exactStartStudent, renewalClass, tomorrow, exactStartPrevious.id_matricula
+      );
+      assertProblemResponse(exactStartConfirmedRequest, 409, "PREVIOUS_YEAR_ENROLLMENT_CANNOT_BE_RENEWED");
+      assert.equal(await countStudentEnrollments(exactStartStudent), 1,
+        "neither request changes the exact-start enrollment set");
+      const unchangedExactStart = await database("matricula")
+        .select(database.raw("inicio_vigencia::text AS inicio_vigencia"), "fim_vigencia", "cancelada_em")
+        .where({ id_matricula: exactStartPrevious.id_matricula }).first();
+      assert.equal(unchangedExactStart.inicio_vigencia, tomorrow);
+      assert.equal(unchangedExactStart.fim_vigencia, null);
+      assert.equal(unchangedExactStart.cancelada_em, null);
+
+      const previousDayStudent = await insertStudent(database);
+      const [previousDayEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: previousDayStudent,
+        id_turma: previousClass,
+        inicio_vigencia: today
+      }).returning("id_matricula");
+      const previousDayRequest = await createFor(previousDayStudent, renewalClass, tomorrow);
+      assertProblemResponse(previousDayRequest, 409, "PREVIOUS_YEAR_ENROLLMENT_CONFIRMATION_REQUIRED");
+      assert.equal(previousDayRequest.jsonBody.previousEnrollmentId, String(previousDayEnrollment.id_matricula));
+      const previousDayConfirmed = await createFor(
+        previousDayStudent, renewalClass, tomorrow, previousDayEnrollment.id_matricula
+      );
+      assert.equal(previousDayConfirmed.status, 201,
+        "a prior enrollment beginning one day earlier remains renewable");
+      assert.equal(await countStudentEnrollments(previousDayStudent), 2);
+
+      const followingDayStudent = await insertStudent(database);
+      await database("matricula").insert({
+        id_usuario_aluno: followingDayStudent,
+        id_turma: previousClass,
+        inicio_vigencia: dayAfterTomorrow
+      }).returning("id_matricula");
+      assertProblemResponse(await createFor(followingDayStudent, renewalClass, tomorrow),
+        409, "ENROLLMENT_ALREADY_ACTIVE");
+      assert.equal(await countStudentEnrollments(followingDayStudent), 1,
+        "a prior enrollment starting one day later is not treated as effective at startDate");
+
+      const staleStudent = await insertStudent(database);
+      const staleClass = await insertClass(database, { schoolYear: 1900000050 });
+      const stalePreviousClass = await insertClass(database, { schoolYear: 1900000049 });
+      const [stalePrevious] = await database("matricula").insert({
+        id_usuario_aluno: staleStudent,
+        id_turma: stalePreviousClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const stalePrompt = await createFor(staleStudent, staleClass, tomorrow);
+      assertProblemResponse(stalePrompt, 409, "PREVIOUS_YEAR_ENROLLMENT_CONFIRMATION_REQUIRED");
+      await database("matricula").where({ id_matricula: stalePrevious.id_matricula }).update({ fim_vigencia: today });
+      const staleConfirmation = await createFor(staleStudent, staleClass, tomorrow, stalePrevious.id_matricula);
+      assertProblemResponse(staleConfirmation, 409, "ENROLLMENT_ALREADY_ACTIVE");
+      assert.equal(await countStudentEnrollments(staleStudent), 1);
+      const unchangedStalePrevious = await database("matricula")
+        .select(database.raw("fim_vigencia::text AS fim_vigencia"))
+        .where({ id_matricula: stalePrevious.id_matricula }).first();
+      assert.equal(unchangedStalePrevious.fim_vigencia, today);
+
+      const replacementStudent = await insertStudent(database);
+      const replacementYear = 1900000060;
+      const replacementTargetClass = await insertClass(database, { schoolYear: replacementYear });
+      const originalPriorClass = await insertClass(database, { series: 1, schoolYear: replacementYear - 1 });
+      const currentPriorClass = await insertClass(database, { series: 2, schoolYear: replacementYear - 1 });
+      const [originalPrior] = await database("matricula").insert({
+        id_usuario_aluno: replacementStudent,
+        id_turma: originalPriorClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const replacementPrompt = await createFor(replacementStudent, replacementTargetClass, tomorrow);
+      assertProblemResponse(replacementPrompt, 409, "PREVIOUS_YEAR_ENROLLMENT_CONFIRMATION_REQUIRED");
+      await database("matricula").where({ id_matricula: originalPrior.id_matricula }).update({ fim_vigencia: today });
+      const [currentPrior] = await database("matricula").insert({
+        id_usuario_aluno: replacementStudent,
+        id_turma: currentPriorClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const staleButReconfirmable = await createFor(replacementStudent, replacementTargetClass, tomorrow,
+        originalPrior.id_matricula);
+      assertProblemResponse(staleButReconfirmable, 409, "PREVIOUS_YEAR_ENROLLMENT_CONFIRMATION_REQUIRED");
+      assert.equal(staleButReconfirmable.jsonBody.previousEnrollmentId, String(currentPrior.id_matricula));
+      assert.equal((await database("matricula").where({ id_matricula: currentPrior.id_matricula }).first()).fim_vigencia,
+        null, "a mismatched confirmation does not close the currently eligible enrollment");
+      const reconfirmed = await createFor(replacementStudent, replacementTargetClass, tomorrow,
+        currentPrior.id_matricula);
+      assert.equal(reconfirmed.status, 201);
+      assert.equal(await countStudentEnrollments(replacementStudent), 3);
+
+      const rollbackStudent = await insertStudent(database);
+      const rollbackYear = 1900000070;
+      const rollbackTargetClass = await insertClass(database, { schoolYear: rollbackYear });
+      const rollbackPreviousClass = await insertClass(database, { schoolYear: rollbackYear - 1 });
+      const [rollbackPrevious] = await database("matricula").insert({
+        id_usuario_aluno: rollbackStudent,
+        id_turma: rollbackPreviousClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const suffix = String(process.pid) + "_" + randomBytes(4).toString("hex");
+      const triggerName = "enrollment_create_fail_insert_" + suffix;
+      const functionName = "enrollment_create_fail_insert_" + suffix;
+      await database.raw([
+        "CREATE FUNCTION " + functionName + "() RETURNS trigger",
+        "LANGUAGE plpgsql AS $$",
+        "BEGIN",
+        "  RAISE EXCEPTION 'synthetic-sensitive-enrollment-insert-error';",
+        "END;",
+        "$$;",
+        "CREATE TRIGGER " + triggerName + " BEFORE INSERT ON matricula",
+        "FOR EACH ROW EXECUTE FUNCTION " + functionName + "();"
+      ].join("\n"));
+      let failedRenewal;
+      try {
+        failedRenewal = await createFor(rollbackStudent, rollbackTargetClass, today, rollbackPrevious.id_matricula);
+      } finally {
+        await database.raw("DROP TRIGGER IF EXISTS " + triggerName + " ON matricula");
+        await database.raw("DROP FUNCTION IF EXISTS " + functionName + "()");
+      }
+      assert.equal(failedRenewal.status, 500);
+      assert.equal(JSON.stringify(failedRenewal).includes("synthetic-sensitive-enrollment-insert-error"), false);
+      assert.equal(await countStudentEnrollments(rollbackStudent), 1);
+      assert.equal((await database("matricula").where({ id_matricula: rollbackPrevious.id_matricula }).first()).fim_vigencia,
+        null, "the old interval update rolls back when insertion fails");
+
+      const concurrentStudent = await insertStudent(database);
+      const concurrentYear = 1900000080;
+      const concurrentTargetClass = await insertClass(database, { schoolYear: concurrentYear });
+      const concurrentPreviousClass = await insertClass(database, { schoolYear: concurrentYear - 1 });
+      const [concurrentPrevious] = await database("matricula").insert({
+        id_usuario_aluno: concurrentStudent,
+        id_turma: concurrentPreviousClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const concurrentResults = await Promise.all([
+        createFor(concurrentStudent, concurrentTargetClass, today, concurrentPrevious.id_matricula, handlers),
+        createFor(concurrentStudent, concurrentTargetClass, today, concurrentPrevious.id_matricula, secondHandlers)
+      ]);
+      assert.equal(concurrentResults.filter((response) => response.status === 201).length, 1);
+      assert.equal(concurrentResults.filter((response) => response.status === 409).length, 1);
+      assert.equal(concurrentResults.find((response) => response.status === 409).jsonBody.code,
+        "ENROLLMENT_ALREADY_ACTIVE");
+      assert.equal(await countStudentEnrollments(concurrentStudent), 2);
+      const concurrentOld = await database("matricula")
+        .select(database.raw("fim_vigencia::text AS fim_vigencia"))
+        .where({ id_matricula: concurrentPrevious.id_matricula }).first();
+      assert.equal(concurrentOld.fim_vigencia, today);
+
+      const records = logs.map((line) => JSON.parse(line));
+      assert.ok(records.every((record) => record.event === "admin_enrollment_create"));
       for (const record of records) {
         assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
+        assert.equal(record.invocationId, "synthetic-enrollment-create");
       }
+      const serializedLogText = records.flatMap((record) => [record.event, record.invocationId, record.result]).join(" ");
+      for (const sensitiveValue of [
+        String(pendingStudent), String(renewalStudent), String(previousEnrollment.id_matricula),
+        "synthetic-sensitive-enrollment-insert-error"
+      ]) assert.equal(serializedLogText.includes(sensitiveValue), false);
+    });
+
+    await t.test("enrollment cancellation validates effective dates, serializes, and sanitizes failures", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("enrollment-cancel-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const handlers = adminEnrollmentHandlers(database);
+      const secondHandlers = adminEnrollmentHandlers(secondConnection);
+      const dates = await database.raw(`
+        SELECT CURRENT_DATE::text AS today,
+          (CURRENT_DATE - 1)::text AS yesterday,
+          (CURRENT_DATE + 1)::text AS tomorrow
+      `);
+      const { today, yesterday, tomorrow } = dates.rows[0];
+      const logs = [];
+      const context = { invocationId: "synthetic-enrollment-cancel", log(message) { logs.push(message); } };
+
+      const studentId = await insertStudent(database);
+      const classId = await insertClass(database);
+      const [enrollment] = await database("matricula").insert({
+        id_usuario_aluno: studentId,
+        id_turma: classId,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const yesterdayResponse = await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(enrollment.id_matricula) },
+        body: { cancellationDate: yesterday }
+      }), context);
+      assertProblemResponse(yesterdayResponse, 422, "VALIDATION_ERROR");
+      const unchangedAfterPastDate = await database("matricula").where({ id_matricula: enrollment.id_matricula }).first();
+      assert.equal(unchangedAfterPastDate.fim_vigencia, null);
+      assert.equal(unchangedAfterPastDate.cancelada_em, null);
+
+      const cancelledToday = await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(enrollment.id_matricula) },
+        body: { cancellationDate: today }
+      }), context);
+      assert.equal(cancelledToday.status, 204);
+      const cancelledRow = await database("matricula")
+        .select(database.raw("fim_vigencia::text AS fim_vigencia"), "cancelada_em")
+        .where({ id_matricula: enrollment.id_matricula }).first();
+      assert.equal(cancelledRow.fim_vigencia, today);
+      assert.ok(cancelledRow.cancelada_em);
+      const effectiveBeforeCancellation = await database("matricula as m")
+        .select("m.id_matricula")
+        .where("m.id_matricula", enrollment.id_matricula)
+        .whereRaw(effectiveEnrollmentPredicate("m", "?::date"), [yesterday, yesterday])
+        .first();
+      const effectiveOnCancellationDate = await database("matricula as m")
+        .select("m.id_matricula")
+        .where("m.id_matricula", enrollment.id_matricula)
+        .whereRaw(effectiveEnrollmentPredicate("m", "?::date"), [today, today])
+        .first();
+      assert.ok(effectiveBeforeCancellation);
+      assert.equal(effectiveOnCancellationDate, undefined);
+      assertProblemResponse(await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(enrollment.id_matricula) },
+        body: { cancellationDate: tomorrow }
+      }), context), 409, "ENROLLMENT_ALREADY_CANCELLED");
+
+      const immediateStartStudent = await insertStudent(database);
+      const immediateStartClass = await insertClass(database);
+      const [immediateStartEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: immediateStartStudent,
+        id_turma: immediateStartClass,
+        inicio_vigencia: today
+      }).returning("id_matricula");
+      assertProblemResponse(await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(immediateStartEnrollment.id_matricula) },
+        body: { cancellationDate: today }
+      }), context), 422, "VALIDATION_ERROR");
+      const immediateStartUnchanged = await database("matricula")
+        .where({ id_matricula: immediateStartEnrollment.id_matricula }).first();
+      assert.equal(immediateStartUnchanged.fim_vigencia, null);
+      assert.equal(immediateStartUnchanged.cancelada_em, null);
+
+      const scheduledStudent = await insertStudent(database);
+      const scheduledClass = await insertClass(database);
+      const [scheduledEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: scheduledStudent,
+        id_turma: scheduledClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      assert.equal((await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(scheduledEnrollment.id_matricula) },
+        body: { cancellationDate: tomorrow }
+      }), context)).status, 204);
+      const futureCancelledRow = await database("matricula")
+        .select(database.raw("fim_vigencia::text AS fim_vigencia"), "cancelada_em")
+        .where({ id_matricula: scheduledEnrollment.id_matricula }).first();
+      assert.equal(futureCancelledRow.fim_vigencia, tomorrow);
+      assert.ok(futureCancelledRow.cancelada_em);
+      assert.ok(await database("matricula as m")
+        .select("m.id_matricula")
+        .where("m.id_matricula", scheduledEnrollment.id_matricula)
+        .whereRaw(effectiveEnrollmentPredicate("m"))
+        .first(), "a future effective end does not cancel the enrollment immediately");
+      assert.equal(await database("matricula as m")
+        .select("m.id_matricula")
+        .where("m.id_matricula", scheduledEnrollment.id_matricula)
+        .whereRaw(effectiveEnrollmentPredicate("m", "?::date"), [tomorrow, tomorrow])
+        .first(), undefined);
+      assertProblemResponse(await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(scheduledEnrollment.id_matricula) },
+        body: { cancellationDate: tomorrow }
+      }), context), 409, "ENROLLMENT_ALREADY_CANCELLED");
+
+      assertProblemResponse(await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: "9223372036854775807" },
+        body: { cancellationDate: today }
+      }), context), 404, "ENROLLMENT_NOT_FOUND");
+      const deletedStudent = await insertStudent(database);
+      const closedClass = await insertClass(database);
+      const [deletedStudentEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: deletedStudent,
+        id_turma: closedClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      await database("usuario").where({ id_usuario: deletedStudent }).update({
+        excluido_em: database.raw("clock_timestamp()")
+      });
+      assertProblemResponse(await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(deletedStudentEnrollment.id_matricula) },
+        body: { cancellationDate: today }
+      }), context), 404, "ENROLLMENT_NOT_FOUND");
+
+      const closedStudent = await insertStudent(database);
+      const [closedEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: closedStudent,
+        id_turma: closedClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const classHandlers = adminClassHandlers(database);
+      const classTag = (await classHandlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: closedClass }
+      }), context)).headers.etag;
+      assert.equal((await classHandlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: closedClass }, ifMatch: classTag
+      }), context)).status, 204);
+      assertProblemResponse(await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(closedEnrollment.id_matricula) },
+        body: { cancellationDate: today }
+      }), context), 409, "CLASS_CLOSED");
+
+      const failingStudent = await insertStudent(database);
+      const failingClass = await insertClass(database);
+      const [failingEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: failingStudent,
+        id_turma: failingClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const suffix = `${process.pid}_${randomBytes(4).toString("hex")}`;
+      const triggerName = `enrollment_test_fail_update_${suffix}`;
+      const functionName = `enrollment_test_fail_update_${suffix}`;
+      await database.raw(`
+        CREATE FUNCTION ${functionName}() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'synthetic-sensitive-enrollment-database-error';
+        END;
+        $$;
+        CREATE TRIGGER ${triggerName}
+        BEFORE UPDATE OF fim_vigencia, cancelada_em ON matricula
+        FOR EACH ROW EXECUTE FUNCTION ${functionName}();
+      `);
+      let failedCancellation;
+      try {
+        failedCancellation = await handlers.cancelEnrollment(accountRequest("POST", {
+          cookie: adminToken,
+          params: { enrollmentId: String(failingEnrollment.id_matricula) },
+          body: { cancellationDate: today }
+        }), context);
+      } finally {
+        await database.raw(`DROP TRIGGER IF EXISTS ${triggerName} ON matricula;`);
+        await database.raw(`DROP FUNCTION IF EXISTS ${functionName}();`);
+      }
+      assert.equal(failedCancellation.status, 500);
+      assert.equal(JSON.stringify(failedCancellation).includes("synthetic-sensitive-enrollment-database-error"), false);
+      const failedRow = await database("matricula").where({ id_matricula: failingEnrollment.id_matricula }).first();
+      assert.equal(failedRow.fim_vigencia, null);
+      assert.equal(failedRow.cancelada_em, null);
+      const failureLogs = logs.map((line) => JSON.parse(line));
+      assert.equal(JSON.stringify(failureLogs).includes("synthetic-sensitive-enrollment-database-error"), false);
+
+      const concurrentStudent = await insertStudent(database);
+      const concurrentClass = await insertClass(database);
+      const [concurrentEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: concurrentStudent,
+        id_turma: concurrentClass,
+        inicio_vigencia: yesterday
+      }).returning("id_matricula");
+      const concurrentEnrollmentTag = (await handlers.getEnrollment(accountRequest("GET", {
+        cookie: adminToken, params: { enrollmentId: String(concurrentEnrollment.id_matricula) }
+      }), context)).headers.etag;
+      const concurrentResults = await Promise.all([
+        handlers.cancelEnrollment(accountRequest("POST", {
+          cookie: adminToken,
+          params: { enrollmentId: String(concurrentEnrollment.id_matricula) },
+          ifMatch: concurrentEnrollmentTag,
+          body: { cancellationDate: today }
+        }), context),
+        secondHandlers.cancelEnrollment(accountRequest("POST", {
+          cookie: adminToken,
+          params: { enrollmentId: String(concurrentEnrollment.id_matricula) },
+          ifMatch: concurrentEnrollmentTag,
+          body: { cancellationDate: today }
+        }), context)
+      ]);
+      assert.equal(concurrentResults.filter((response) => response.status === 204).length, 1);
+      assert.equal(concurrentResults.filter((response) => response.status === 412).length, 1);
+
+      const records = logs.map((line) => JSON.parse(line));
+      assert.ok(records.every((record) => record.event === "admin_enrollment_cancel"
+        || record.event === "admin_class_close"));
+      for (const record of records) {
+        assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
+        assert.equal(record.invocationId, "synthetic-enrollment-cancel");
+      }
+      const serializedLogText = records.flatMap((record) => [record.event, record.invocationId, record.result]).join(" ");
+      for (const sensitiveValue of [
+        String(studentId), String(enrollment.id_matricula), String(scheduledStudent),
+        "synthetic-sensitive-enrollment-database-error"
+      ]) assert.equal(serializedLogText.includes(sensitiveValue), false);
     });
 
     await t.test("subject offers are idempotent, preserve results, and remove related state atomically", async () => {
@@ -2516,22 +2896,29 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
         assertProblemResponse(incompatible, 404, "RESOURCE_NOT_FOUND");
       }
       const deletedClassId = await insertClass(database);
-      const deletedClassResponse = await handlers.deleteClass(accountRequest("DELETE", {
+      assert.equal((await handlers.addClassSubject(accountRequest("PUT", {
+        cookie: adminToken, params: { classId: deletedClassId, subjectId: subjectZ }
+      }), context)).status, 204);
+      const deletedClassTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: deletedClassId }
+      }), context)).headers.etag;
+      assert.equal((await handlers.closeClass(accountRequest("POST", {
+        cookie: adminToken, params: { classId: deletedClassId }, ifMatch: deletedClassTag
+      }), context)).status, 204);
+      const closedSubjects = await handlers.listClassSubjects(accountRequest("GET", {
         cookie: adminToken, params: { classId: deletedClassId }
       }), context);
-      assert.equal(deletedClassResponse.status, 204);
-      assertProblemResponse(await handlers.listClassSubjects(accountRequest("GET", {
-        cookie: adminToken, params: { classId: deletedClassId }
-      }), context), 404, "RESOURCE_NOT_FOUND");
+      assert.equal(closedSubjects.status, 200);
+      assert.deepEqual(closedSubjects.jsonBody.items.map((item) => item.subjectId), [subjectZ]);
       assertProblemResponse(await handlers.addClassSubject(accountRequest("PUT", {
         cookie: adminToken, params: { classId: deletedClassId, subjectId: subjectZ }
-      }), context), 404, "RESOURCE_NOT_FOUND");
+      }), context), 409, "CLASS_CLOSED");
       assertProblemResponse(await handlers.listClassSubjects(accountRequest("GET", {
         cookie: adminToken, params: { classId: "9223372036854775807" }
       }), context), 404, "RESOURCE_NOT_FOUND");
       assertProblemResponse(await handlers.removeClassSubject(accountRequest("DELETE", {
         cookie: adminToken, params: { classId: deletedClassId, subjectId: subjectZ }
-      }), context), 404, "RESOURCE_NOT_FOUND");
+      }), context), 409, "CLASS_CLOSED");
       assertProblemResponse(await handlers.removeClassSubject(accountRequest("DELETE", {
         cookie: adminToken, params: { classId, subjectId: "9223372036854775807" }
       }), context), 404, "RESOURCE_NOT_FOUND");
@@ -2780,42 +3167,90 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.equal(await database("professor").where({ id_usuario: teacherId }).first() !== undefined, true);
     });
 
-    await t.test("phase 02 migration is additive, forward-only, and applies to the initial schema", async () => {
+    await t.test("class lifecycle migration is forward-only and fails closed when class rows exist", async () => {
       const columns = await database.raw(`
         SELECT column_name, data_type, is_nullable, column_default
         FROM information_schema.columns
         WHERE table_schema = current_schema()
           AND table_name = 'turma'
-          AND column_name = 'excluido_em'
+          AND column_name IN ('excluido_em', 'inicio_em', 'fechada_em', 'version', 'subjects_version')
+        ORDER BY column_name
       `);
-      assert.deepEqual(columns.rows, [{
-        column_name: "excluido_em",
-        data_type: "timestamp with time zone",
-        is_nullable: "YES",
-        column_default: null
+      assert.deepEqual(columns.rows, [
+        {
+          column_name: "fechada_em",
+          data_type: "timestamp with time zone",
+          is_nullable: "YES",
+          column_default: null
+        },
+        {
+          column_name: "inicio_em",
+          data_type: "date",
+          is_nullable: "NO",
+          column_default: null
+        },
+        {
+          column_name: "subjects_version",
+          data_type: "integer",
+          is_nullable: "NO",
+          column_default: "1"
+        },
+        {
+          column_name: "version",
+          data_type: "integer",
+          is_nullable: "NO",
+          column_default: "1"
+        }
+      ]);
+
+      const teacherVersion = await database.raw(`
+        SELECT data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'turma_disciplina'
+          AND column_name = 'teachers_version'
+      `);
+      assert.deepEqual(teacherVersion.rows, [{
+        data_type: "integer", is_nullable: "NO", column_default: "1"
       }]);
 
-      const legacyConstraint = await database.raw(`
-        SELECT 1
+      const classUnique = await database.raw(`
+        SELECT pg_get_constraintdef(oid, true) AS definition
         FROM pg_constraint
-        WHERE conrelid = 'turma'::regclass
-          AND conname = 'turma_serie_ano_uk'
+        WHERE conrelid = 'turma'::regclass AND conname = 'turma_serie_ano_uk'
       `);
-      assert.equal(legacyConstraint.rows.length, 0);
-      const activeIndex = await database.raw(`
-        SELECT index_row.indisunique,
-               pg_get_expr(index_row.indpred, index_row.indrelid) AS predicate,
-               pg_get_indexdef(index_row.indexrelid) AS definition
-        FROM pg_index AS index_row
-        JOIN pg_class AS index_name ON index_name.oid = index_row.indexrelid
-        WHERE index_name.relname = 'turma_serie_ano_ativa_uk'
+      assert.equal(classUnique.rows.length, 1);
+      assert.match(classUnique.rows[0].definition, /UNIQUE \(serie, ano_letivo\)/i);
+      const oldIndex = await database.raw(`
+        SELECT 1 FROM pg_class WHERE relname = 'turma_serie_ano_ativa_uk'
       `);
-      assert.equal(activeIndex.rows.length, 1);
-      assert.equal(activeIndex.rows[0].indisunique, true);
-      assert.match(activeIndex.rows[0].predicate, /excluido_em IS NULL/i);
-      assert.match(activeIndex.rows[0].definition, /\(serie, ano_letivo\)/);
-    });
+      assert.equal(oldIndex.rows.length, 0);
 
+      const migration = require("../migrations/202610120001_class_lifecycle_and_versions.js");
+      await database.transaction(async (transaction) => {
+        await transaction.raw(`
+          CREATE TEMP TABLE turma (
+            id_turma BIGINT,
+            serie INTEGER,
+            ano_letivo INTEGER,
+            excluido_em TIMESTAMPTZ
+          ) ON COMMIT DROP
+        `);
+        await transaction.raw("INSERT INTO turma VALUES (7, 1, 2026, NULL)");
+        await assert.rejects(migration.up(transaction), /requires an empty turma table/);
+        const preserved = await transaction("turma").first();
+        assert.equal(String(preserved.id_turma), "7");
+        assert.equal(preserved.excluido_em, null);
+        const startColumn = await transaction.raw(`
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = (
+            SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()
+          ) AND table_name = 'turma' AND column_name = 'inicio_em'
+        `);
+        assert.equal(startColumn.rows.length, 0);
+      });
+      await assert.rejects(migration.down(), /forward-only/);
+    });
     await t.test("creates precisely the 16 approved domain tables", async () => {
       const result = await database.raw(`
         SELECT tablename
@@ -2994,7 +3429,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
     await t.test("enforces deferred profile consistency and physical constraints", async () => {
       const studentId = await insertStudent(database);
       const professorId = await insertProfessor(database);
-      const classId = (await database("turma").insert({ serie: 1, ano_letivo: 2026 }).returning("id_turma"))[0].id_turma;
+      const classId = await insertClass(database, { series: 1, schoolYear: 2026 });
       const subjectId = (await database("materia").insert({ nome: "Matemática" }).returning("id_materia"))[0].id_materia;
       const offerId = (await database("turma_disciplina").insert({ id_turma: classId, id_materia: subjectId }).returning("id_turma_disciplina"))[0].id_turma_disciplina;
 
@@ -3008,8 +3443,12 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
         inicio_vigencia: "2026-01-01"
       });
 
-      await expectPgCode(database("turma").insert({ serie: 4, ano_letivo: 2026 }), "23514");
-      await expectPgCode(database("turma").insert({ serie: 1, ano_letivo: 2026 }), "23505");
+      await expectPgCode(database("turma").insert({
+        serie: 4, ano_letivo: 2026, inicio_em: database.raw("CURRENT_DATE - 1")
+      }), "23514");
+      await expectPgCode(database("turma").insert({
+        serie: 1, ano_letivo: 2026, inicio_em: database.raw("CURRENT_DATE - 1")
+      }), "23505");
       await expectPgCode(database("materia").insert({ nome: "  matemática " }), "23505");
       await expectPgCode(database("matricula").insert({
         id_usuario_aluno: studentId,
@@ -3212,7 +3651,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
 
     await t.test("enforces simulation and result constraints and composite references", async () => {
       const studentId = await insertStudent(database);
-      const classId = (await database("turma").insert({ serie: 2, ano_letivo: 2027 }).returning("id_turma"))[0].id_turma;
+      const classId = await insertClass(database, { series: 2, schoolYear: 2027 });
       const subjectId = (await database("materia").insert({ nome: "Ciências" }).returning("id_materia"))[0].id_materia;
       await database("turma_disciplina").insert({ id_turma: classId, id_materia: subjectId });
       const simulationId = (await database("simulado").insert({
@@ -3310,46 +3749,6 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       }), "23503");
     });
 
-    await t.test("serializes concurrent administrator deletion so one active account remains", async () => {
-      const previousActive = await database("usuario")
-        .select("id_usuario", "ativado_em")
-        .where({ tipo_perfil: "administrador" })
-        .whereNotNull("ativado_em")
-        .whereNull("excluido_em");
-      const previousIds = previousActive.map((row) => row.id_usuario);
-      try {
-        if (previousIds.length > 0) {
-          await database("usuario").whereIn("id_usuario", previousIds).update({ ativado_em: null });
-        }
-        const firstAdminId = await database.transaction((transaction) => insertUser(transaction, {
-          profile: "administrador",
-          email: newIdentity("concurrent-admin-delete-a"),
-          name: "Synthetic Concurrent Administrator A"
-        }));
-        const secondAdminId = await database.transaction((transaction) => insertUser(transaction, {
-          profile: "administrador",
-          email: newIdentity("concurrent-admin-delete-b"),
-          name: "Synthetic Concurrent Administrator B"
-        }));
-
-        const results = await Promise.all([
-          deleteAccount(database, "administrador", String(firstAdminId), String(secondAdminId)),
-          deleteAccount(secondConnection, "administrador", String(secondAdminId), String(firstAdminId))
-        ]);
-        assert.equal(results.filter((result) => result.status === "deleted").length, 1);
-        assert.equal(results.filter((result) => result.status === "last-active-administrator").length, 1);
-        const remainingActive = await database("usuario")
-          .where({ tipo_perfil: "administrador" })
-          .whereNotNull("ativado_em")
-          .whereNull("excluido_em")
-          .count();
-        assert.equal(Number(remainingActive[0].count), 1);
-      } finally {
-        for (const account of previousActive) {
-          await database("usuario").where({ id_usuario: account.id_usuario }).update({ ativado_em: account.ativado_em });
-        }
-      }
-    });
   } finally {
     if (secondConnection) {
       await secondConnection.destroy().catch(() => {});
