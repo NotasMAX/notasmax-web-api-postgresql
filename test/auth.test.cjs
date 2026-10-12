@@ -729,6 +729,34 @@ test("administrative account mutations reject Origin and custom-header failures 
   assert.equal(databaseCalls, 0);
 });
 
+test("admin account creation logs a sanitized failure stage when reading the request body fails", async () => {
+  const privateValue = "private@example.test synthetic-password database-stack";
+  const logs = [];
+  const handlers = createAdminAccountHandlers({
+    getDatabase() { throw new Error("database access must not happen before body parsing"); },
+    allowedOrigins: [allowedOrigin]
+  });
+  const response = await handlers.createTeacher(request("POST", {
+    origin: allowedOrigin,
+    "x-requested-with": "XMLHttpRequest"
+  }, new Error(privateValue)), {
+    invocationId: "synthetic-admin-create",
+    log(message) { logs.push(message); }
+  });
+
+  assertProblem(response, 500);
+  const diagnostic = logs
+    .map((message) => JSON.parse(message))
+    .find((entry) => entry.event === "admin_account_create_failure");
+  assert.deepEqual(diagnostic, {
+    event: "admin_account_create_failure",
+    invocationId: "synthetic-admin-create",
+    stage: "request_body"
+  });
+  const serialized = JSON.stringify({ response, logs });
+  assert.equal(serialized.includes(privateValue), false);
+});
+
 test("retired account DELETE routes return the same static 404 without database access", async () => {
   let databaseCalls = 0;
   const handlers = createAdminAccountHandlers({
@@ -788,23 +816,39 @@ test("fake email transport requires explicit local mode and an HTTPS host and ne
     NODE_ENV: "production",
     NOTASMAX_EMAIL_TRANSPORT: "fake",
     NOTASMAX_WEB_BASE_URL: "https://web.example.test"
-  }));
+  }), (error) => error.reasonCodes.includes("node_environment_not_local"));
   assert.throws(() => createFakeEmailAdapter({
     NODE_ENV: "test",
     NOTASMAX_EMAIL_TRANSPORT: "fake",
     NOTASMAX_WEB_BASE_URL: "http://localhost:5173"
-  }));
+  }), (error) => error.reasonCodes.includes("web_base_url_invalid"));
   assert.throws(() => createFakeEmailAdapter({
     NODE_ENV: "test",
     NOTASMAX_EMAIL_TRANSPORT: "fake",
     NOTASMAX_WEB_BASE_URL: "https://web.example.test",
     WEBSITE_SITE_NAME: "synthetic-function-app"
-  }));
+  }), (error) => error.reasonCodes.includes("azure_site_name_marker_present"));
+  assert.throws(() => createFakeEmailAdapter({
+    NODE_ENV: "test",
+    NOTASMAX_EMAIL_TRANSPORT: "fake",
+    NOTASMAX_WEB_BASE_URL: "https://web.example.test",
+    WEBSITE_HOSTNAME: "function-app.azurewebsites.net"
+  }), (error) => error.reasonCodes.includes("azure_hostname_marker_present"));
+
+  assert.throws(() => createFakeEmailAdapter({
+    NODE_ENV: "test",
+    NOTASMAX_WEB_BASE_URL: "https://web.example.test"
+  }), (error) => error.reasonCodes.includes("fake_transport_not_enabled"));
+  assert.throws(() => createFakeEmailAdapter({
+    NODE_ENV: "test",
+    NOTASMAX_EMAIL_TRANSPORT: "fake"
+  }), (error) => error.reasonCodes.includes("web_base_url_missing"));
 
   const adapter = createFakeEmailAdapter({
     NODE_ENV: "test",
     NOTASMAX_EMAIL_TRANSPORT: "fake",
-    NOTASMAX_WEB_BASE_URL: "https://web.example.test"
+    NOTASMAX_WEB_BASE_URL: "https://web.example.test",
+    WEBSITE_HOSTNAME: "localhost:7071"
   });
   const secretToken = "synthetic-token-that-must-not-be-displayed";
   const message = {

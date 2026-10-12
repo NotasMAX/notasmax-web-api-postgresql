@@ -3,6 +3,7 @@ import type {
   HttpResponseInit,
   InvocationContext
 } from "@azure/functions";
+import { logDevelopmentEvent } from "../http/security-event";
 
 export type HealthProbe = () => Promise<boolean>;
 
@@ -21,12 +22,12 @@ export function createHealthHandler(probe: HealthProbe) {
     }
 
     const durationMs = Math.max(0, Date.now() - startedAt);
-    context.log(JSON.stringify({
+    logDevelopmentEvent(context, {
       event: "health_check",
       invocationId: context.invocationId,
       outcome: healthy ? "ok" : "unavailable",
       durationMs
-    }));
+    });
 
     if (healthy) {
       return {

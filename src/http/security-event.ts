@@ -5,22 +5,33 @@ type SecurityEventHandler = (
   context: InvocationContext
 ) => Promise<HttpResponseInit>;
 
+type ApplicationLogValue = string | number | readonly string[];
+
+export function logDevelopmentEvent(
+  context: InvocationContext,
+  fields: Record<string, ApplicationLogValue>
+): void {
+  if (process.env.NODE_ENV !== "development") return;
+
+  try {
+    context.log(JSON.stringify(fields));
+  } catch {
+    // Logging failure must not change an operation result.
+  }
+}
+
 export function logSecurityEvent(
   context: InvocationContext,
   event: string,
   result: string,
   startedAt: number
 ): void {
-  try {
-    context.log(JSON.stringify({
-      event,
-      invocationId: context.invocationId,
-      result,
-      durationMs: Math.max(0, Date.now() - startedAt)
-    }));
-  } catch {
-    // Logging failure must not change an account operation result.
-  }
+  logDevelopmentEvent(context, {
+    event,
+    invocationId: context.invocationId,
+    result,
+    durationMs: Math.max(0, Date.now() - startedAt)
+  });
 }
 
 export function withSecurityEvent(event: string, handler: SecurityEventHandler): SecurityEventHandler {

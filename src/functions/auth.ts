@@ -3,6 +3,7 @@ import { deleteExpiredLifecycleTokens } from "../auth/account-lifecycle-service"
 import { createAccountLifecycleHandlers } from "../auth/account-lifecycle-handler";
 import { createAuthHandlers } from "../auth/handler";
 import { getKnex } from "../database/knex";
+import { logDevelopmentEvent } from "../http/security-event";
 
 const authHandlers = createAuthHandlers();
 const accountLifecycleHandlers = createAccountLifecycleHandlers();
@@ -62,20 +63,20 @@ app.timer("cleanupExpiredAccountLifecycleTokens", {
     const startedAt = Date.now();
     try {
       const deletedRecords = await deleteExpiredLifecycleTokens(getKnex());
-      context.log(JSON.stringify({
+      logDevelopmentEvent(context, {
         event: "expired_account_token_cleanup",
         invocationId: context.invocationId,
         result: "completed",
         deletedRecords,
         durationMs: Math.max(0, Date.now() - startedAt)
-      }));
+      });
     } catch {
-      context.log(JSON.stringify({
+      logDevelopmentEvent(context, {
         event: "expired_account_token_cleanup",
         invocationId: context.invocationId,
         result: "failed",
         durationMs: Math.max(0, Date.now() - startedAt)
-      }));
+      });
     }
   }
 });

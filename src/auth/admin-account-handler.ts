@@ -4,7 +4,7 @@ import { z } from "zod";
 import { getKnex } from "../database/knex";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
 import { ifMatchProblem, readIfMatch } from "../http/etag";
-import { logSecurityEvent, withSecurityEvent } from "../http/security-event";
+import { logDevelopmentEvent, logSecurityEvent, withSecurityEvent } from "../http/security-event";
 import {
   authenticationFailed,
   authenticationRequired,
@@ -26,6 +26,7 @@ import {
 } from "./admin-account-service";
 import { issueActivationToken } from "./account-lifecycle-service";
 import {
+  AccountEmailAdapterConfigurationError,
   accountActionUrl,
   resolveAccountEmailAdapter,
   type EmailTransport
@@ -198,6 +199,42 @@ function emailAdapter(options: AdminAccountHandlerOptions) {
   });
 }
 
+type AccountCreateFailureStage =
+  | "request_body"
+  | "admin_session"
+  | "email_configuration"
+  | "account_persistence"
+  | "activation_token";
+
+function logAccountCreateFailure(
+  context: InvocationContext,
+  stage: AccountCreateFailureStage
+): void {
+  logDevelopmentEvent(context, {
+    event: "admin_account_create_failure",
+    invocationId: context.invocationId,
+    stage
+  });
+}
+
+function accountCreateFailure(
+  context: InvocationContext,
+  stage: AccountCreateFailureStage,
+  reasonCodes?: readonly string[]
+): HttpResponseInit {
+  if (reasonCodes === undefined) {
+    logAccountCreateFailure(context, stage);
+  } else {
+    logDevelopmentEvent(context, {
+      event: "admin_account_create_failure",
+      invocationId: context.invocationId,
+      stage,
+      reasonCodes
+    });
+  }
+  return internalFailure();
+}
+
 async function sendActivation(
   knex: Knex,
   userId: string,
@@ -259,39 +296,61 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
 
   const create = (profile: AccountProfile, schema: z.ZodType): RequestHandler => withSecurityEvent(
     "admin_account_create",
-    async (request) => {
+    async (request, context) => {
       const rejected = mutationRejection(request, allowedOrigins);
       if (rejected) return rejected;
       let body;
       try {
         body = await validateJsonBody(request, schema, { maxBytes: MAX_ADMIN_ACCOUNT_BODY_BYTES });
       } catch {
-        return internalFailure();
+        return accountCreateFailure(context, "request_body");
       }
       if (!body.success) return body.response;
-      const authorized = await requireAdminSession(request, getDatabase);
-      if (!authorized.authorized) return authorized.response;
+
+      let authorized: Awaited<ReturnType<typeof requireAdminSession>>;
+      try {
+        authorized = await requireAdminSession(request, getDatabase);
+      } catch {
+        return accountCreateFailure(context, "admin_session");
+      }
+      if (!authorized.authorized) {
+        if ((authorized.response.status ?? 200) >= 500) {
+          logAccountCreateFailure(context, "admin_session");
+        }
+        return authorized.response;
+      }
 
       let adapter: ReturnType<typeof emailAdapter>;
       try {
         adapter = emailAdapter(options);
-      } catch {
-        return internalFailure();
+      } catch (error) {
+        const reasonCodes = error instanceof AccountEmailAdapterConfigurationError
+          ? error.reasonCodes
+          : ["unclassified_email_configuration_error"];
+        return accountCreateFailure(context, "email_configuration", reasonCodes);
+      }
+
+      let userId: string;
+      try {
+        userId = await createAccount(getDatabase(), profile, body.data as NewAccount, {
+          actorId: authorized.user.id, token: authorized.token
+        });
+      } catch (error) {
+        if (sessionWasRevoked(error)) return authenticationRequired();
+        return isUniqueViolation(error)
+          ? emailAlreadyInUse()
+          : accountCreateFailure(context, "account_persistence");
       }
 
       try {
-        const userId = await createAccount(getDatabase(), profile, body.data as NewAccount, {
-          actorId: authorized.user.id, token: authorized.token
-        });
         const activationEmailStatus = await sendActivation(getDatabase(), userId, adapter);
         return {
           status: 201,
           headers: { "cache-control": "no-store" },
           jsonBody: { activationEmailStatus }
         };
-      } catch (error) {
-        if (sessionWasRevoked(error)) return authenticationRequired();
-        return isUniqueViolation(error) ? emailAlreadyInUse() : internalFailure();
+      } catch {
+        return accountCreateFailure(context, "activation_token");
       }
     }
   );

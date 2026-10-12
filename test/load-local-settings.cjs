@@ -10,3 +10,6 @@ if (fs.existsSync(settingsPath)) {
     }
   }
 }
+
+// Unit and integration test processes exercise development-only application logging.
+process.env.NODE_ENV = "development";
