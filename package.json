@@ -12,7 +12,7 @@
     "lint": "eslint \"**/*.{js,cjs,mjs,jsx,ts,cts,mts,tsx}\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "func start",
-    "test": "node --require ./test/load-local-settings.cjs --test ./test/health.test.cjs ./test/auth.test.cjs ./test/subject.test.cjs ./test/class.test.cjs ./test/database-safety.test.cjs ./test/postgres.integration.test.cjs",
+    "test": "node --require ./test/load-local-settings.cjs --test ./test/health.test.cjs ./test/auth.test.cjs ./test/subject.test.cjs ./test/class.test.cjs ./test/simulation.test.cjs ./test/result.test.cjs ./test/database-safety.test.cjs ./test/postgres.integration.test.cjs",
     "test:integration": "node ./test/run-integration-tests.cjs",
     "db:migrate:latest": "knex migrate:latest --knexfile knexfile.cjs --env development",
     "db:migrate:status": "knex migrate:list --knexfile knexfile.cjs --env development",

@@ -213,6 +213,37 @@ A oferta exige turma e matéria ativas; IDs inexistentes, excluídos ou incompat
 
 A migration `202610100001_class_logical_deletion.js` adiciona `turma.excluido_em TIMESTAMPTZ` e substitui a unicidade geral de série/ano por um índice único parcial para turmas ativas. Migrations históricas não são alteradas.
 
+## Administração de simulados
+
+Todas as rotas exigem sessão ativa de administrador. As mutações também exigem `Origin` permitido e `X-Requested-With: XMLHttpRequest`. IDs de simulado são sempre limitados à turma informada no caminho. Respostas protegidas usam `Cache-Control: no-store`; erros seguem RFC 9457.
+
+| Método e rota | Finalidade |
+|---|---|
+| `GET /api/v1/admin/classes/{classId}/simulations` | Lista simulados ativos com paginação e filtros opcionais `bimester`, `type`, `subjectId`, `fromDate` e `toDate`. |
+| `POST /api/v1/admin/classes/{classId}/simulations` | Cria simulado e atribui o menor número positivo disponível na turma. Retorna `201`, representação e ETag forte. |
+| `GET /api/v1/admin/classes/{classId}/simulations/{simulationId}` | Consulta a representação do simulado e seu ETag forte. |
+| `PATCH /api/v1/admin/classes/{classId}/simulations/{simulationId}` | Atualiza `type`, `bimester`, `scheduledDate` e/ou `subjects`; exige o ETag atual em `If-Match`. |
+| `POST /api/v1/admin/classes/{classId}/simulations/{simulationId}/realizations` | Confirma a realização, congela os alunos matriculados efetivamente na turma na data agendada e cria os resultados pendentes na mesma transação. Exige `If-Match`. |
+| `DELETE /api/v1/admin/classes/{classId}/simulations/{simulationId}` | Faz exclusão lógica antes da confirmação e sem resultados vinculados; exige `If-Match` e retorna `204`. |
+
+A lista retorna `{ items, pagination: { page, pageSize, totalItems, totalPages } }`, com `page=1`, `pageSize=20` e máximo de 100. A ordenação é estável por data agendada, número e ID. O corpo de criação contém `type` (`objetivo` ou `dissertativo`), `bimester` (1 a 4), `scheduledDate` (data civil) e `subjects`, com `subjectId`, `totalQuestions` positivo e `weightPercent` maior que zero e até 100. Pelo menos uma matéria atualmente oferecida à turma é obrigatória. Datas passadas são aceitas. Os pesos ativos da mesma matéria e bimestre não podem exceder 100%; uma alocação parcial representa média provisória.
+
+PATCH, confirmação e exclusão retornam `428` sem `If-Match`, `400` para valor inválido e `412` para ETag desatualizado. O PATCH é permitido até a confirmação, inclusive após a data agendada. Turma fechada impede mutações e confirmação, mas mantém consultas históricas. A confirmação aceita zero alunos elegíveis. Tentativa de excluir simulado confirmado ou com resultados retorna `409 SIMULATION_HAS_LINKED_ANSWERS`.
+
+## Administração de resultados
+
+Todas as rotas exigem sessão ativa de administrador, verificam turma, simulado confirmado, participante congelado e matéria pertencente àquele simulado, e respondem com `Cache-Control: no-store`.
+
+| Método e rota | Finalidade |
+|---|---|
+| `GET /api/v1/admin/classes/{classId}/simulations/{simulationId}/results` | Lista os resultados com paginação comum (`page=1`, `pageSize=20`, máximo 100); filtros opcionais: `subjectId`, `status` (`pending`, `assessed`, `absent`) e `search` por nome ou ID do aluno. |
+| `GET /api/v1/admin/classes/{classId}/simulations/{simulationId}/results/{studentId}/{subjectId}` | Consulta um resultado e seu ETag forte. |
+| `PATCH /api/v1/admin/classes/{classId}/simulations/{simulationId}/results/{studentId}/{subjectId}` | Atualiza estado/acertos; exige ETag forte atual no `If-Match`. |
+
+As listas retornam `{ items, pagination: { page, pageSize, totalItems, totalPages } }`. Cada item usa camelCase: `simulationId`, `studentId`, `studentName`, `subjectId`, `subjectName`, `status`, `correctAnswers`, `totalQuestions`, `weightPercent`, `score` e `weightedContribution`. A representação individual é a mesma e seu ETag cobre todos esses campos. Nota avaliada é `(correctAnswers / totalQuestions) × 10`; contribuição ponderada é `score × weightPercent / 100`, mantendo precisão completa. Resultado pendente tem `score` e `weightedContribution` nulos. Ausência é explícita, tem `correctAnswers: null` e contribui com nota zero; zero acertos é uma nota avaliada válida.
+
+O PATCH recebe `status`; ao usar `assessed`, também recebe `correctAnswers` inteiro entre zero e `totalQuestions`. As transições aceitas são `pending → assessed|absent`, `absent → assessed` e `assessed → assessed` para correção. `assessed → absent` é recusado. `If-Match` ausente retorna `428`, malformado ou fraco retorna `400`, e obsoleto retorna `412`. Conflitos de transição usam RFC 9457 `409`; estado de simulado não confirmado também retorna `409`. Não há histórico persistido das correções.
+
 ## Testes e verificações
 
 Execute o lint, a verificação de tipos e a compilação:
