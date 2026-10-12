@@ -196,7 +196,7 @@ Todas as rotas abaixo exigem sessão ativa de administrador. As mutações tamb�
 | Método e rota | Finalidade |
 |---|---|
 | `GET /api/v1/admin/classes` | Lista turmas ativas por `schoolYear`, com paginação. O ano é opcional e, quando omitido, usa o ano-calendário atual. |
-| `GET /api/v1/admin/classes/years` | Lista, em ordem decrescente e sem paginação, os anos letivos que têm turmas ativas. |
+| `GET /api/v1/admin/school-years` | Lista, em ordem decrescente e sem paginação, os anos letivos que têm turmas ativas. |
 | `POST /api/v1/admin/classes` | Cria turma com `series` e `schoolYear`; retorna `201` com `{ classId, series, schoolYear }`. |
 | `GET /api/v1/admin/classes/{classId}` | Consulta os dados básicos da turma ativa. |
 | `PATCH /api/v1/admin/classes/{classId}` | Atualiza parcialmente `series` e/ou `schoolYear`; corpo vazio retorna `422 VALIDATION_ERROR`. |
@@ -205,7 +205,7 @@ Todas as rotas abaixo exigem sessão ativa de administrador. As mutações tamb�
 | `PUT /api/v1/admin/classes/{classId}/subjects/{subjectId}` | Associa matéria ativa à turma; operação idempotente, retorna `204`. |
 | `DELETE /api/v1/admin/classes/{classId}/subjects/{subjectId}` | Remove a oferta e as associações atuais de professores; operação idempotente, retorna `204` quando a turma e a matéria estão ativas. |
 
-A lista de turmas retorna `{ items: [{ classId, series, schoolYear }], pagination: { page, pageSize, totalItems, totalPages } }`, com `page=1`, `pageSize=20`, máximo de 100 itens e ordenação por ano letivo e série. `/classes/years` retorna `{ items: [{ schoolYear }] }`. As séries aceitas são os inteiros `1`, `2` e `3`; o ano letivo é inteiro, sem limite temporal. Há uma turma ativa por combinação série/ano; a combinação pode ser reutilizada depois da exclusão lógica. Duplicidade ativa retorna `409 CLASS_ALREADY_EXISTS`.
+A lista de turmas retorna `{ items: [{ classId, series, schoolYear }], pagination: { page, pageSize, totalItems, totalPages } }`, com `page=1`, `pageSize=20`, máximo de 100 itens e ordenação por ano letivo e série. `GET /api/v1/admin/school-years` retorna `{ items: [{ schoolYear }] }`. As séries aceitas são os inteiros `1`, `2` e `3`; o ano letivo é inteiro, sem limite temporal. Há uma turma ativa por combinação série/ano; a combinação pode ser reutilizada depois da exclusão lógica. Duplicidade ativa retorna `409 CLASS_ALREADY_EXISTS`.
 
 O PATCH de série ou ano retorna `409 CLASS_HAS_LINKED_DATA` enquanto houver matrícula, oferta ou simulado vinculado. A exclusão lógica da turma é bloqueada por matrícula vigente na data da operação, oferta associada ou simulado ativo. Para esta regra, simulado ativo é aquele sem confirmação de realização e sem exclusão lógica; a data agendada não altera o estado. Matrículas encerradas ou canceladas, e simulados confirmados ou cancelados, não bloqueiam a exclusão da turma. IDs de turma inexistentes ou excluídos em operações por ID retornam `404 CLASS_NOT_FOUND`.
 
@@ -274,6 +274,8 @@ if (!body.success) return body.response;
 Falhas de JSON malformado e de formato/tipo nos parâmetros de rota ou query retornam `400 Bad Request`. JSON válido que não atende ao schema do corpo retorna `422 Unprocessable Content`. As respostas usam `Content-Type: application/problem+json`, `type: about:blank` e `code: VALIDATION_ERROR`; os itens `errors[]` usam somente `FIELD_REQUIRED`, `INVALID_TYPE`, `INVALID_FORMAT`, `VALUE_OUT_OF_RANGE` ou `INVALID_VALUE`.
 
 Os campos legíveis são apresentados em português, sem incluir valores rejeitados ou mensagens internas do validador. Erros do corpo apontam para o campo por JSON Pointer, escapando `~` como `~0` e `/` como `~1`; erros de rota e query identificam o parâmetro pelo nome.
+
+Os textos públicos de RFC 9457 (`title`, `detail` e `errors[].detail`) são destinados à apresentação direta pelos clientes e devem ser sanitizados. Não inclua exceções, SQL, stack traces, segredos ou valores sensíveis enviados na requisição. Os clientes usam `code` para lógica de máquina e exibem os textos públicos da API mesmo quando um código não estiver presente. Login, sessão e recuperação pública usam mensagens genéricas quando necessário para não revelar se uma conta existe; rotas administrativas autenticadas podem retornar conflitos específicos para orientar o administrador. O idioma é definido pelo contrato de cada endpoint; a resposta técnica de health check conserva o título legado `Service Unavailable`.
 
 Exemplo de erro de campo:
 

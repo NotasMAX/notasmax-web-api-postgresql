@@ -405,6 +405,43 @@ test("known-account login runs Argon2 verification before opening a transaction"
   assert.equal(insertedSessions.length, 1);
 });
 
+test("login session cookie covers authenticated API routes", async () => {
+  const fixture = createLoginRaceFixture({
+    id_usuario: "42",
+    email_institucional: "admin@example.test",
+    tipo_perfil: "administrador",
+    nome_completo: "Synthetic Administrator",
+    hash_senha: "synthetic-password-hash",
+    ativado_em: new Date("2026-10-09T12:00:00.000Z"),
+    excluido_em: null,
+    falhas_login_na_janela: 0,
+    inicio_janela_falhas_login: null,
+    bloqueado_ate: null
+  });
+  const handlers = createAuthHandlers({
+    getDatabase: () => fixture.knex,
+    allowedOrigins: [allowedOrigin]
+  });
+  const originalVerify = argon2.verify;
+  argon2.verify = async () => true;
+
+  let response;
+  try {
+    response = await handlers.createSession(request("POST", {
+      origin: allowedOrigin,
+      "x-requested-with": "XMLHttpRequest"
+    }, loginBody), noContext);
+  } finally {
+    argon2.verify = originalVerify;
+  }
+
+  assert.equal(response.status, 200);
+  const cookie = response.cookies.find((entry) => entry.name === "notasmax_session");
+  assert.ok(cookie);
+  assert.equal(cookie.path, "/api/v1");
+  assert.ok("/api/v1/admin/students".startsWith(cookie.path + "/"));
+});
+
 test("stale password verification cannot create a session after the account hash changes", async () => {
   const fixture = createLoginRaceFixture({
     id_usuario: "42",

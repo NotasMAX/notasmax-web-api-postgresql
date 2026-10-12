@@ -477,7 +477,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.equal(firstCookie.httpOnly, true);
       assert.equal(firstCookie.secure, true);
       assert.equal(firstCookie.sameSite, "None");
-      assert.equal(firstCookie.path, "/api/v1/auth");
+      assert.equal(firstCookie.path, "/api/v1");
       assert.equal(firstCookie.maxAge, 8 * 60 * 60);
       assert.equal(firstCookie.domain, undefined);
 
@@ -535,7 +535,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.deepEqual(sessionCookie(logout), {
         name: "notasmax_session",
         value: "",
-        path: "/api/v1/auth",
+        path: "/api/v1",
         httpOnly: true,
         secure: true,
         sameSite: "None",

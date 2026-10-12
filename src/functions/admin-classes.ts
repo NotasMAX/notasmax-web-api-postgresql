@@ -13,7 +13,7 @@ app.http("adminClassesList", {
 app.http("adminClassesYears", {
   methods: ["GET"],
   authLevel: "anonymous",
-  route: "v1/admin/classes/years",
+  route: "v1/admin/school-years",
   handler: handlers.listClassYears
 });
 

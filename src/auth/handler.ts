@@ -12,7 +12,7 @@ import {
 } from "./session-service";
 
 const SESSION_COOKIE_NAME = "notasmax_session";
-const SESSION_COOKIE_PATH = "/api/v1/auth";
+const SESSION_COOKIE_PATH = "/api/v1";
 const SESSION_ABSOLUTE_SECONDS = 8 * 60 * 60;
 const AUTHENTICATION_CHALLENGE = "NotasMAX-Session";
 const LOGIN_BODY_MAX_BYTES = 8 * 1024;
