@@ -7,10 +7,14 @@ export type IfMatchResult =
   | { status: "missing" }
   | { status: "malformed" };
 
+export function isStrongOpaqueEtag(value: string): boolean {
+  return /^"[\x21\x23-\x7E]*"$/.test(value);
+}
+
 export function readIfMatch(request: Pick<HttpRequest, "headers">): IfMatchResult {
   const value = request.headers.get("if-match");
   if (value === null) return { status: "missing" };
-  if (!/^"[\x21\x23-\x7E]*"$/.test(value)) return { status: "malformed" };
+  if (!isStrongOpaqueEtag(value)) return { status: "malformed" };
   return { status: "ok", value };
 }
 

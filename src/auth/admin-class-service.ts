@@ -1,5 +1,5 @@
 import type { Knex } from "knex";
-import { strongEtag } from "../http/etag";
+import { isStrongOpaqueEtag, strongEtag } from "../http/etag";
 import { AdminSessionRevokedError, lockAdminMutationSessions } from "./session-service";
 import { removeCurrentTeachersForOffer } from "./teacher-association-service";
 
@@ -9,7 +9,7 @@ export type NewClass = {
   series: number;
   schoolYear: number;
   startDate: string;
-  closeClassIds?: Array<{ classId: string; expectedVersion: number }>;
+  closeClassIds?: Array<{ classId: string; etag?: unknown }>;
 };
 export type ClassPatch = Partial<Pick<NewClass, "series" | "schoolYear">>;
 export type SchoolClass = { classId: string; series: number; schoolYear: number; startDate: string };
@@ -24,7 +24,10 @@ type ClassRow = {
   subjects_version: number;
 };
 
-function classItem(row: ClassRow): SchoolClass {
+type ClassRepresentationRow = Pick<ClassRow,
+  "id_turma" | "serie" | "ano_letivo" | "inicio_em" | "version">;
+
+function classItem(row: ClassRepresentationRow): SchoolClass {
   const startDate = row.inicio_em instanceof Date
     ? row.inicio_em.toISOString().slice(0, 10)
     : String(row.inicio_em).slice(0, 10);
@@ -36,7 +39,7 @@ function classItem(row: ClassRow): SchoolClass {
   };
 }
 
-function classTag(row: ClassRow): string {
+function classTag(row: ClassRepresentationRow): string {
   return strongEtag({ ...classItem(row), version: Number(row.version) });
 }
 
@@ -172,13 +175,15 @@ export async function createClass(
       const valid = selected.every((selection) => {
         const row = byId.get(selection.classId);
         return row !== undefined
+          && typeof selection.etag === "string"
+          && isStrongOpaqueEtag(selection.etag)
           && row.fechada_em === null
           && Number(row.serie) === input.series
           && Number(row.ano_letivo) === input.schoolYear - 1
           && (row.inicio_em instanceof Date
             ? row.inicio_em.toISOString().slice(0, 10)
             : String(row.inicio_em).slice(0, 10)) <= businessDate
-          && Number(row.version) === selection.expectedVersion;
+          && classTag(row) === selection.etag;
       });
       if (!valid) return { status: "selection-invalid" };
 

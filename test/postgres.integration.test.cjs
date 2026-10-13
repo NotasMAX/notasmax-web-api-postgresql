@@ -2100,6 +2100,14 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       }), context);
       assert.deepEqual(detail.jsonBody, first.jsonBody);
       assert.match(detail.headers.etag, /^"[A-Za-z0-9_-]+"$/);
+      assert.equal(detail.headers["access-control-expose-headers"], "ETag");
+      const unapprovedOriginDetail = await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken,
+        origin: "https://attacker.example.test",
+        params: { classId: first.jsonBody.classId }
+      }), context);
+      assert.equal(unapprovedOriginDetail.status, 200);
+      assert.equal(unapprovedOriginDetail.headers["access-control-expose-headers"], undefined);
       const classRow = () => database("turma").where({ id_turma: first.jsonBody.classId }).first();
 
       const noOp = await handlers.updateClass(accountRequest("PATCH", {
@@ -2174,6 +2182,9 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       });
       const selectedStudentId = await insertStudent(database);
       const selectedStudentToken = await insertAuthSession(database, selectedStudentId);
+      const selectedSourceTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: selectedSourceId }
+      }), context)).headers.etag;
       await database("matricula").insert({
         id_usuario_aluno: selectedStudentId, id_turma: selectedSourceId,
         inicio_vigencia: yesterday, fim_vigencia: null, cancelada_em: null
@@ -2184,7 +2195,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
           series: 2,
           schoolYear: currentYear + 101,
           startDate: today,
-          closeClassIds: [{ classId: selectedSourceId, expectedVersion: 1 }]
+          closeClassIds: [{ classId: selectedSourceId, etag: selectedSourceTag }]
         }
       }), context);
       assert.equal(selected.status, 201);
@@ -2200,6 +2211,9 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       const rollbackSourceId = await insertClass(database, {
         series: 1, schoolYear: currentYear + 300, startDate: today
       });
+      const rollbackSourceTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: rollbackSourceId }
+      }), context)).headers.etag;
       const classCountBefore = Number((await database("turma").count({ count: "id_turma" }).first()).count);
       const selectionError = await handlers.createClass(accountRequest("POST", {
         cookie: adminToken,
@@ -2208,8 +2222,8 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
           schoolYear: currentYear + 301,
           startDate: today,
           closeClassIds: [
-            { classId: rollbackSourceId, expectedVersion: 1 },
-            { classId: "9223372036854775807", expectedVersion: 1 }
+            { classId: rollbackSourceId, etag: rollbackSourceTag },
+            { classId: "9223372036854775807", etag: rollbackSourceTag }
           ]
         }
       }), context);
@@ -2218,7 +2232,168 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.equal(Number((await database("turma").count({ count: "id_turma" }).first()).count), classCountBefore);
       assert.equal((await database("turma").where({ id_turma: rollbackSourceId }).first()).fechada_em, null);
 
-      const staleSelection = await handlers.createClass(accountRequest("POST", {
+      let isolatedYear = Math.max(currentYear + 500, 1_500_000_000);
+      const expectSelectionRejection = async ({ source, etag, year }) => {
+        const beforeCount = Number((await database("turma").count({ count: "id_turma" }).first()).count);
+        const beforeSource = await database("turma").where({ id_turma: source.id }).first();
+        const response = await handlers.createClass(accountRequest("POST", {
+          cookie: adminToken,
+          body: {
+            series: 2,
+            schoolYear: year,
+            startDate: today,
+            closeClassIds: [{ classId: source.id, etag }]
+          }
+        }), context);
+        assertProblemResponse(response, 409, "CLASS_SELECTION_INVALID");
+        assert.deepEqual(response.jsonBody.errors[0].source, { in: "body", pointer: "/closeClassIds" });
+        assert.equal(Number((await database("turma").count({ count: "id_turma" }).first()).count), beforeCount);
+        const afterSource = await database("turma").where({ id_turma: source.id }).first();
+        assert.equal(
+          afterSource.fechada_em === null ? null : new Date(afterSource.fechada_em).getTime(),
+          beforeSource.fechada_em === null ? null : new Date(beforeSource.fechada_em).getTime()
+        );
+        assert.equal(Number(afterSource.version), Number(beforeSource.version));
+      };
+      const eligibleSource = async ({ series = 2, targetYear = isolatedYear++ } = {}) => {
+        const id = await insertClass(database, { series, schoolYear: targetYear - 1, startDate: yesterday });
+        const tag = (await handlers.getClass(accountRequest("GET", {
+          cookie: adminToken, params: { classId: id }
+        }), context)).headers.etag;
+        return { id, tag, targetYear };
+      };
+
+      const malformedCases = ["W/\"weak\"", "*", '"one", "two"', "", "unquoted"];
+      for (const invalidEtag of malformedCases) {
+        const source = await eligibleSource();
+        await expectSelectionRejection({ source, etag: invalidEtag, year: source.targetYear });
+      }
+      for (const invalidEtag of [undefined, null, 42]) {
+        const source = await eligibleSource();
+        const closeClassItem = { classId: source.id };
+        if (invalidEtag !== undefined) closeClassItem.etag = invalidEtag;
+        const beforeCount = Number((await database("turma").count({ count: "id_turma" }).first()).count);
+        const beforeSource = await database("turma").where({ id_turma: source.id }).first();
+        const response = await handlers.createClass(accountRequest("POST", {
+          cookie: adminToken,
+          body: { series: 2, schoolYear: source.targetYear, startDate: today, closeClassIds: [closeClassItem] }
+        }), context);
+        assertProblemResponse(response, 409, "CLASS_SELECTION_INVALID");
+        assert.equal(Number((await database("turma").count({ count: "id_turma" }).first()).count), beforeCount);
+        const afterSource = await database("turma").where({ id_turma: source.id }).first();
+        assert.equal(
+          afterSource.fechada_em === null ? null : new Date(afterSource.fechada_em).getTime(),
+          beforeSource.fechada_em === null ? null : new Date(beforeSource.fechada_em).getTime()
+        );
+        assert.equal(Number(afterSource.version), Number(beforeSource.version));
+      }
+
+      const staleSource = await eligibleSource();
+      await database("turma").where({ id_turma: staleSource.id }).update({ version: database.raw("version + 1") });
+      await expectSelectionRejection({ source: staleSource, etag: staleSource.tag, year: staleSource.targetYear });
+
+      const wrongClassSource = await eligibleSource();
+      const otherClassSource = await eligibleSource();
+      await expectSelectionRejection({ source: wrongClassSource, etag: otherClassSource.tag, year: wrongClassSource.targetYear });
+
+      const closedIneligibleSource = await eligibleSource();
+      await database("turma").where({ id_turma: closedIneligibleSource.id }).update({ fechada_em: database.raw("clock_timestamp()"), version: database.raw("version + 1") });
+      const closedTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: closedIneligibleSource.id }
+      }), context)).headers.etag;
+      await expectSelectionRejection({ source: closedIneligibleSource, etag: closedTag, year: closedIneligibleSource.targetYear });
+
+      const wrongSeriesTargetYear = isolatedYear++;
+      const wrongSeriesSource = await insertClass(database, {
+        series: 3, schoolYear: wrongSeriesTargetYear - 1, startDate: yesterday
+      });
+      const wrongSeriesTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: wrongSeriesSource }
+      }), context)).headers.etag;
+      await expectSelectionRejection({ source: { id: wrongSeriesSource }, etag: wrongSeriesTag, year: wrongSeriesTargetYear });
+
+      const futureTargetYear = isolatedYear++;
+      const futureSource = await insertClass(database, {
+        series: 2, schoolYear: futureTargetYear - 1, startDate: tomorrow
+      });
+      const futureSourceTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: futureSource }
+      }), context)).headers.etag;
+      await expectSelectionRejection({ source: { id: futureSource }, etag: futureSourceTag, year: futureTargetYear });
+      const duplicateSource = await eligibleSource();
+      const duplicateClassCount = Number((await database("turma").count({ count: "id_turma" }).first()).count);
+      const duplicateSourceBefore = await database("turma").where({ id_turma: duplicateSource.id }).first();
+      const duplicateSelection = await handlers.createClass(accountRequest("POST", {
+        cookie: adminToken,
+        body: {
+          series: 2,
+          schoolYear: duplicateSource.targetYear,
+          startDate: today,
+          closeClassIds: [
+            { classId: duplicateSource.id, etag: duplicateSource.tag },
+            { classId: duplicateSource.id, etag: duplicateSource.tag }
+          ]
+        }
+      }), context);
+      assertProblemResponse(duplicateSelection, 409, "CLASS_SELECTION_INVALID");
+      assert.deepEqual(duplicateSelection.jsonBody.errors[0].source, { in: "body", pointer: "/closeClassIds" });
+      assert.equal(Number((await database("turma").count({ count: "id_turma" }).first()).count), duplicateClassCount);
+      const duplicateSourceAfter = await database("turma").where({ id_turma: duplicateSource.id }).first();
+      assert.equal(
+        duplicateSourceAfter.fechada_em === null ? null : new Date(duplicateSourceAfter.fechada_em).getTime(),
+        duplicateSourceBefore.fechada_em === null ? null : new Date(duplicateSourceBefore.fechada_em).getTime()
+      );
+      assert.equal(Number(duplicateSourceAfter.version), Number(duplicateSourceBefore.version));
+
+      const raceSourceId = await insertClass(database, {
+        series: 3, schoolYear: currentYear + 400, startDate: yesterday
+      });
+      const raceSourceTag = (await handlers.getClass(accountRequest("GET", {
+        cookie: adminToken, params: { classId: raceSourceId }
+      }), context)).headers.etag;
+      const raceWorkerName = `class-etag-worker-${process.pid}`;
+      const blocker = makeKnex({
+        ...connectionFromEnvironment(generatedDatabase),
+        application_name: `class-etag-blocker-${process.pid}`
+      });
+      const worker = makeKnex({ ...targetConnection, application_name: raceWorkerName });
+      let releaseBlocker;
+      let signalLocked;
+      const locked = new Promise((resolve) => { signalLocked = resolve; });
+      const continueBlocker = new Promise((resolve) => { releaseBlocker = resolve; });
+      const blockerTransaction = database.transaction(async (transaction) => {
+        await transaction("turma").where({ id_turma: raceSourceId }).forUpdate().first();
+        signalLocked();
+        await continueBlocker;
+        await transaction("turma").where({ id_turma: raceSourceId })
+          .update({ version: transaction.raw("version + 1") });
+      });
+      const raceClassCount = Number((await database("turma").count({ count: "id_turma" }).first()).count);
+      try {
+        await locked;
+        const workerHandlers = adminClassHandlers(worker);
+        const pendingCreate = workerHandlers.createClass(accountRequest("POST", {
+          cookie: adminToken,
+          body: {
+            series: 3,
+            schoolYear: currentYear + 401,
+            startDate: today,
+            closeClassIds: [{ classId: raceSourceId, etag: raceSourceTag }]
+          }
+        }), context);
+        await waitForLockWait(blocker, raceWorkerName);
+        releaseBlocker();
+        await blockerTransaction;
+        assertProblemResponse(await pendingCreate, 409, "CLASS_SELECTION_INVALID");
+        assert.equal(Number((await database("turma").count({ count: "id_turma" }).first()).count), raceClassCount);
+        assert.equal((await database("turma").where({ id_turma: raceSourceId }).first()).fechada_em, null);
+      } finally {
+        releaseBlocker();
+        await blockerTransaction.catch(() => undefined);
+        await Promise.all([blocker.destroy(), worker.destroy()]);
+      }
+
+      const retiredNumericForm = await handlers.createClass(accountRequest("POST", {
         cookie: adminToken,
         body: {
           series: 2,
@@ -2227,7 +2402,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
           closeClassIds: [{ classId: selectedSourceId, expectedVersion: 1 }]
         }
       }), context);
-      assertProblemResponse(staleSelection, 409, "CLASS_SELECTION_INVALID");
+      assertProblemResponse(retiredNumericForm, 422, "VALIDATION_ERROR");
 
       const linkedClassId = await insertClass(database);
       const linkedSubjectId = await insertSubject(database);

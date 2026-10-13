@@ -58,7 +58,7 @@ const createSchema = z.strictObject({
   startDate: z.iso.date(),
   closeClassIds: z.array(z.strictObject({
     classId: idSchema,
-    expectedVersion: z.number().int().positive()
+    etag: z.unknown().optional()
   })).optional()
 });
 const patchSchema = z.strictObject({
@@ -210,8 +210,19 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
 
     try {
       const schoolClass = await getClass(getDatabase(), route.data.classId);
+      const origin = request.headers.get("origin");
       return schoolClass
-        ? { status: 200, headers: { "cache-control": "no-store", etag: schoolClass.etag }, jsonBody: schoolClass.schoolClass }
+        ? {
+          status: 200,
+          headers: {
+            "cache-control": "no-store",
+            etag: schoolClass.etag,
+            ...(origin !== null && allowedOrigins.includes(origin)
+              ? { "access-control-expose-headers": "ETag" }
+              : {})
+          },
+          jsonBody: schoolClass.schoolClass
+        }
         : classNotFound();
     } catch {
       return internalFailure();
