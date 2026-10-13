@@ -3,6 +3,7 @@ import type { Knex } from "knex";
 import { z } from "zod";
 import { getKnex } from "../database/knex";
 import { withSecurityEvent } from "../http/security-event";
+import { etagExposureHeaders } from "../http/cors";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
 import { ifMatchProblem, readIfMatch } from "../http/etag";
 import {
@@ -217,9 +218,7 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
           headers: {
             "cache-control": "no-store",
             etag: schoolClass.etag,
-            ...(origin !== null && allowedOrigins.includes(origin)
-              ? { "access-control-expose-headers": "ETag" }
-              : {})
+            ...etagExposureHeaders(origin, allowedOrigins)
           },
           jsonBody: schoolClass.schoolClass
         }
@@ -325,7 +324,15 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
       const result = await listClassSubjects(getDatabase(), route.data.classId);
       return result.status === "not-found"
         ? resourceNotFound()
-        : { status: 200, headers: { "cache-control": "no-store", etag: result.etag }, jsonBody: { items: result.items } };
+        : {
+          status: 200,
+          headers: {
+            "cache-control": "no-store",
+            etag: result.etag,
+            ...etagExposureHeaders(request.headers.get("origin"), allowedOrigins)
+          },
+          jsonBody: { items: result.items }
+        };
     } catch {
       return internalFailure();
     }

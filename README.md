@@ -161,7 +161,7 @@ Todas as rotas `/api/v1/admin/*` abaixo exigem sessão ativa de administrador ve
 | `GET /api/v1/admin/teachers` | Lista professores; aceita `search`, `classId`, `subjectId`, `page` e `pageSize`. Quando turma e matéria são informadas juntas, devem corresponder à mesma associação existente. |
 | `POST /api/v1/admin/teachers` | Cria professor pendente. Campos: `name`, `email` e `contactPhone` opcional. |
 | `GET`, `PATCH`, `DELETE /api/v1/admin/teachers/{teacherId}` | Consulta, edita ou faz exclusão lógica do professor. |
-| `GET /api/v1/admin/classes/{classId}/subjects/{subjectId}/teachers` | Lista em `{ items: [{ teacherId, name, email, activationStatus }] }` os professores associados atualmente à matéria oferecida pela turma; não há paginação. |
+| `GET /api/v1/admin/classes/{classId}/subjects/{subjectId}/teachers` | Lista em `{ items: [{ teacherId, name, email, activationStatus }] }` os professores associados atualmente à matéria oferecida pela turma; não há paginação. Retorna ETag forte e o expõe ao JavaScript para origens permitidas pelo CORS. |
 | `PUT /api/v1/admin/classes/{classId}/subjects/{subjectId}/teachers/{teacherId}` | Adiciona a associação atual; permite vários professores e retorna `204`. Repetir a associação também retorna `204`. |
 | `DELETE /api/v1/admin/classes/{classId}/subjects/{subjectId}/teachers/{teacherId}` | Remove somente a associação atual, sem excluir o professor nem manter histórico; retorna `204`, inclusive se a associação já estiver ausente. |
 | `GET /api/v1/admin/administrators` | Lista administradores; aceita `search`, `page` e `pageSize`. |
@@ -201,7 +201,7 @@ Todas as rotas abaixo exigem sessão ativa de administrador. As mutações tamb�
 | `GET /api/v1/admin/classes/{classId}` | Consulta os dados básicos da turma ativa, incluindo `isClosed`, derivado de `turma.fechada_em IS NOT NULL`. Retorna ETag forte para a representação pública. |
 | `PATCH /api/v1/admin/classes/{classId}` | Atualiza parcialmente `series` e/ou `schoolYear`; retorna a representação básica da turma atualizada. Corpo vazio retorna `422 VALIDATION_ERROR`. |
 | `DELETE /api/v1/admin/classes/{classId}` | Faz exclusão lógica e retorna `204`; repetir a exclusão também retorna `204`. |
-| `GET /api/v1/admin/classes/{classId}/subjects` | Lista matérias ativas oferecidas à turma, sem paginação e em ordem crescente por nome. |
+| `GET /api/v1/admin/classes/{classId}/subjects` | Lista matérias ativas oferecidas à turma, sem paginação e em ordem crescente por nome. Retorna ETag forte e o expõe ao JavaScript para origens permitidas pelo CORS. |
 | `PUT /api/v1/admin/classes/{classId}/subjects/{subjectId}` | Associa matéria ativa à turma; operação idempotente, retorna `204`. |
 | `DELETE /api/v1/admin/classes/{classId}/subjects/{subjectId}` | Remove a oferta e as associações atuais de professores; operação idempotente, retorna `204` quando a turma e a matéria estão ativas. |
 
