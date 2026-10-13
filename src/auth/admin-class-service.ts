@@ -13,6 +13,7 @@ export type NewClass = {
 };
 export type ClassPatch = Partial<Pick<NewClass, "series" | "schoolYear">>;
 export type SchoolClass = { classId: string; series: number; schoolYear: number; startDate: string };
+type ClassReadRepresentation = SchoolClass & { isClosed: boolean };
 
 type ClassRow = {
   id_turma: string | number;
@@ -25,7 +26,7 @@ type ClassRow = {
 };
 
 type ClassRepresentationRow = Pick<ClassRow,
-  "id_turma" | "serie" | "ano_letivo" | "inicio_em" | "version">;
+  "id_turma" | "serie" | "ano_letivo" | "inicio_em" | "fechada_em" | "version">;
 
 function classItem(row: ClassRepresentationRow): SchoolClass {
   const startDate = row.inicio_em instanceof Date
@@ -39,8 +40,12 @@ function classItem(row: ClassRepresentationRow): SchoolClass {
   };
 }
 
-function classTag(row: ClassRepresentationRow): string {
-  return strongEtag({ ...classItem(row), version: Number(row.version) });
+function classReadItem(row: ClassRepresentationRow): ClassReadRepresentation {
+  return { ...classItem(row), isClosed: row.fechada_em !== null };
+}
+
+function classTag(row: ClassRepresentationRow, representation = classReadItem(row)): string {
+  return strongEtag({ ...representation, version: Number(row.version) });
 }
 
 function numericSort(left: string, right: string): number {
@@ -102,7 +107,7 @@ async function schoolClassById(
 export async function listClasses(
   knex: Knex,
   filters: ClassListQuery
-): Promise<{ items: SchoolClass[]; pagination: {
+): Promise<{ items: ClassReadRepresentation[]; pagination: {
   page: number; pageSize: number; totalItems: number; totalPages: number;
 } }> {
   let schoolYear = filters.schoolYear;
@@ -128,7 +133,7 @@ export async function listClasses(
     .orderBy("ano_letivo", "asc").orderBy("serie", "asc").orderBy("id_turma", "asc")
     .limit(filters.pageSize).offset((filters.page - 1) * filters.pageSize) as ClassRow[];
   return {
-    items: rows.map(classItem),
+    items: rows.map(classReadItem),
     pagination: {
       page: filters.page, pageSize: filters.pageSize, totalItems,
       totalPages: Math.ceil(totalItems / filters.pageSize)
@@ -145,9 +150,11 @@ export async function listActiveSchoolYears(knex: Knex): Promise<{ items: Array<
 export async function getClass(
   knex: Knex,
   classId: string
-): Promise<{ schoolClass: SchoolClass; etag: string } | undefined> {
+): Promise<{ schoolClass: ClassReadRepresentation; etag: string } | undefined> {
   const row = await schoolClassById(knex, classId);
-  return row ? { schoolClass: classItem(row), etag: classTag(row) } : undefined;
+  if (!row) return undefined;
+  const schoolClass = classReadItem(row);
+  return { schoolClass, etag: classTag(row, schoolClass) };
 }
 
 type CreateClassResult =

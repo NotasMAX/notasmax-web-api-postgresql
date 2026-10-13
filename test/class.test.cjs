@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { createAdminClassHandlers } = require("../dist/auth/admin-class-handler.js");
+const { getClass, listClasses } = require("../dist/auth/admin-class-service.js");
 const { createAdminEnrollmentHandlers } = require("../dist/auth/admin-enrollment-handler.js");
 const { createEnrollment } = require("../dist/auth/admin-enrollment-service.js");
 
@@ -31,6 +32,50 @@ function assertProblem(response, status, code) {
   if (code !== undefined) assert.equal(response.jsonBody.code, code);
   return response.jsonBody;
 }
+
+test("class list and detail read representations derive isClosed consistently", async () => {
+  const fixtures = [
+    {
+      id_turma: "31", serie: 1, ano_letivo: 2026, inicio_em: "2026-02-01",
+      fechada_em: null, version: 1, subjects_version: 1, expectedClosed: false
+    },
+    {
+      id_turma: "32", serie: 2, ano_letivo: 2026, inicio_em: "2026-02-02",
+      fechada_em: "2026-06-30T12:00:00.000Z", version: 2, subjects_version: 1, expectedClosed: true
+    }
+  ];
+  const expectedKeys = ["classId", "isClosed", "schoolYear", "series", "startDate"];
+  const readKnex = (rows) => Object.assign((table) => {
+    assert.equal(table, "turma");
+    let countQuery = false;
+    const query = {
+      select() { return this; },
+      where() { return this; },
+      orderBy() { return this; },
+      limit() { return this; },
+      offset() { return this; },
+      count() { countQuery = true; return this; },
+      async first() { return countQuery ? { total_items: rows.length } : rows[0]; },
+      then(resolve, reject) { return Promise.resolve(rows).then(resolve, reject); }
+    };
+    return query;
+  }, { raw(value) { return value; } });
+
+  const list = await listClasses(readKnex(fixtures), { schoolYear: 2026, page: 1, pageSize: 20 });
+  assert.equal(list.items.length, fixtures.length);
+  for (const [index, fixture] of fixtures.entries()) {
+    const listed = list.items[index];
+    const detail = await getClass(readKnex([fixture]), fixture.id_turma);
+    assert.ok(detail);
+    assert.equal(listed.isClosed, fixture.expectedClosed);
+    assert.equal(detail.schoolClass.isClosed, fixture.expectedClosed);
+    assert.deepEqual(Object.keys(listed).sort(), expectedKeys);
+    assert.deepEqual(Object.keys(detail.schoolClass).sort(), expectedKeys);
+    assert.deepEqual(detail.schoolClass, listed);
+    assert.equal(Object.hasOwn(listed, "fechada_em"), false);
+    assert.equal(Object.hasOwn(detail.schoolClass, "fechada_em"), false);
+  }
+});
 
 function renewalKnex({ previousStartDate, effectiveOnStart = true }) {
   const writes = [];

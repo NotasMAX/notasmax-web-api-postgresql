@@ -2074,6 +2074,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       for (const response of [first, future, older]) assert.equal(response.status, 201);
       assert.deepEqual(Object.keys(first.jsonBody).sort(), ["classId", "schoolYear", "series", "startDate"]);
       assert.equal(first.jsonBody.startDate, today);
+      assert.equal(Object.hasOwn(first.jsonBody, "isClosed"), false);
       assert.match(first.headers.etag, /^"[A-Za-z0-9_-]+"$/);
 
       const duplicate = await handlers.createClass(accountRequest("POST", {
@@ -2089,17 +2090,21 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       });
       assert.deepEqual(defaultPage.jsonBody.items.map((item) => item.series), [2, 3]);
       assert.equal(defaultPage.jsonBody.items.every((item) => item.schoolYear === currentYear), true);
+      assert.equal(defaultPage.jsonBody.items.every((item) => item.isClosed === false), true);
       const filtered = await handlers.listClasses(accountRequest("GET", {
         cookie: adminToken,
         query: new URLSearchParams("schoolYear=" + (currentYear - 1) + "&page=1&pageSize=1")
       }), context);
-      assert.deepEqual(filtered.jsonBody.items, [older.jsonBody]);
+      assert.deepEqual(filtered.jsonBody.items, [{ ...older.jsonBody, isClosed: false }]);
 
       const detail = await handlers.getClass(accountRequest("GET", {
         cookie: adminToken, params: { classId: first.jsonBody.classId }
       }), context);
-      assert.deepEqual(detail.jsonBody, first.jsonBody);
+      assert.deepEqual(detail.jsonBody, { ...first.jsonBody, isClosed: false });
+      assert.deepEqual(Object.keys(detail.jsonBody).sort(), ["classId", "isClosed", "schoolYear", "series", "startDate"]);
+      assert.equal(detail.jsonBody.isClosed, false);
       assert.match(detail.headers.etag, /^"[A-Za-z0-9_-]+"$/);
+      assert.equal(detail.headers.etag, first.headers.etag);
       assert.equal(detail.headers["access-control-expose-headers"], "ETag");
       const unapprovedOriginDetail = await handlers.getClass(accountRequest("GET", {
         cookie: adminToken,
@@ -2159,8 +2164,21 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       const closedFutureRepresentation = await handlers.getClass(accountRequest("GET", {
         cookie: adminToken, params: { classId: future.jsonBody.classId }
       }), context);
+      assert.equal(closedFutureRepresentation.jsonBody.isClosed, true);
+      assert.deepEqual(Object.keys(closedFutureRepresentation.jsonBody).sort(), [
+        "classId", "isClosed", "schoolYear", "series", "startDate"
+      ]);
       assert.equal(futureClose.headers.etag, closedFutureRepresentation.headers.etag);
       assert.notEqual(futureClose.headers.etag, futureTag);
+      const closedYearList = await handlers.listClasses(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams(`schoolYear=${currentYear}&page=1&pageSize=20`)
+      }), context);
+      const closedListItem = closedYearList.jsonBody.items.find((item) => item.classId === future.jsonBody.classId);
+      assert.ok(closedListItem, "closed class remains available in the class list");
+      assert.equal(closedListItem.isClosed, true);
+      assert.deepEqual(closedListItem, closedFutureRepresentation.jsonBody);
+      assert.equal(Object.hasOwn(closedListItem, "fechada_em"), false);
       const closedFuture = await database("turma").where({ id_turma: future.jsonBody.classId }).first();
       assert.ok(closedFuture.fechada_em);
       assert.equal(Number(closedFuture.version), 2);
