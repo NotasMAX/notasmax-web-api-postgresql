@@ -3962,12 +3962,45 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       }), {});
       assert.equal(created.status, 201);
       assert.equal(created.jsonBody.number, 1);
-      assert.equal(created.headers.etag.startsWith('"'), true);
+      assert.match(created.headers.etag, /^"[A-Za-z0-9_-]+"$/);
+      assert.equal(created.headers["access-control-expose-headers"], "ETag");
       const current = await handlers.get(baseRequest("GET", {
         params: { classId, simulationId: created.jsonBody.simulationId }
       }), {});
       assert.equal(current.status, 200);
       assert.equal(current.headers.etag, created.headers.etag);
+      assert.match(current.headers.etag, /^"[A-Za-z0-9_-]+"$/);
+      assert.equal(current.headers["access-control-expose-headers"], "ETag");
+      const hiddenFromUnapprovedOrigin = await handlers.get(accountRequest("GET", {
+        origin: "https://unapproved.example.test", cookie: token,
+        params: { classId, simulationId: created.jsonBody.simulationId }
+      }), {});
+      assert.equal(hiddenFromUnapprovedOrigin.status, 200);
+      assert.equal(hiddenFromUnapprovedOrigin.headers.etag, current.headers.etag);
+      assert.equal(hiddenFromUnapprovedOrigin.headers["access-control-expose-headers"], undefined);
+      const unapprovedOriginContext = { invocationId: "synthetic-unapproved-simulation-origin", log() {} };
+      const unapprovedMutationRequests = await Promise.all([
+        handlers.create(accountRequest("POST", { origin: "https://unapproved.example.test", cookie: token,
+          params: { classId }, body: createBody(20) }), unapprovedOriginContext),
+        handlers.update(accountRequest("PATCH", { origin: "https://unapproved.example.test", cookie: token,
+          params: { classId, simulationId: created.jsonBody.simulationId },
+          body: { scheduledDate: "2026-10-13" }, ifMatch: current.headers.etag }), unapprovedOriginContext),
+        handlers.confirm(accountRequest("POST", { origin: "https://unapproved.example.test", cookie: token,
+          params: { classId, simulationId: created.jsonBody.simulationId }, ifMatch: current.headers.etag }), unapprovedOriginContext)
+      ]);
+      for (const rejected of unapprovedMutationRequests) {
+        assertProblemResponse(rejected, 403, "ORIGIN_NOT_ALLOWED");
+        assert.equal(rejected.headers.etag, undefined);
+        assert.equal(rejected.headers["access-control-expose-headers"], undefined);
+      }
+      const updated = await handlers.update(baseRequest("PATCH", {
+        params: { classId, simulationId: created.jsonBody.simulationId },
+        body: { scheduledDate: "2026-10-12" }, ifMatch: current.headers.etag
+      }), {});
+      assert.equal(updated.status, 200);
+      assert.match(updated.headers.etag, /^"[A-Za-z0-9_-]+"$/);
+      assert.equal(updated.headers["access-control-expose-headers"], "ETag");
+      assert.equal(updated.headers.etag, current.headers.etag);
       assertProblemResponse(await handlers.get(baseRequest("GET", {
         params: { classId: otherClassId, simulationId: created.jsonBody.simulationId }
       }), {}), 404, "RESOURCE_NOT_FOUND");
@@ -4028,6 +4061,8 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
         params: { classId, simulationId: created.jsonBody.simulationId }, ifMatch: current.headers.etag
       }), {});
       assert.equal(confirmed.status, 200);
+      assert.match(confirmed.headers.etag, /^"[A-Za-z0-9_-]+"$/);
+      assert.equal(confirmed.headers["access-control-expose-headers"], "ETag");
       assert.equal(confirmed.jsonBody.realizedAt === null, false);
       assert.deepEqual(await database("simulado_aluno").where({ id_simulado: created.jsonBody.simulationId })
         .pluck("id_usuario_aluno").then((ids) => ids.map(String)), [String(eligibleStudent)]);

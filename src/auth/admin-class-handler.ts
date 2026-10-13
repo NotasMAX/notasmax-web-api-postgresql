@@ -8,6 +8,7 @@ import { ifMatchProblem, readIfMatch } from "../http/etag";
 import {
   authenticationRequired,
   configuredOrigins,
+  etagExposureHeaders,
   internalFailure,
   mutationRejection,
   requireAdminSession,
@@ -210,16 +211,13 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
 
     try {
       const schoolClass = await getClass(getDatabase(), route.data.classId);
-      const origin = request.headers.get("origin");
       return schoolClass
         ? {
           status: 200,
           headers: {
             "cache-control": "no-store",
             etag: schoolClass.etag,
-            ...(origin !== null && allowedOrigins.includes(origin)
-              ? { "access-control-expose-headers": "ETag" }
-              : {})
+            ...etagExposureHeaders(request, allowedOrigins)
           },
           jsonBody: schoolClass.schoolClass
         }

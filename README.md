@@ -232,6 +232,8 @@ A lista retorna `{ items, pagination: { page, pageSize, totalItems, totalPages }
 
 PATCH, confirmação e exclusão retornam `428` sem `If-Match`, `400` para valor inválido e `412` para ETag desatualizado. O PATCH é permitido até a confirmação, inclusive após a data agendada. Turma fechada impede mutações e confirmação, mas mantém consultas históricas. A confirmação aceita zero alunos elegíveis. Tentativa de excluir simulado confirmado ou com resultados retorna `409 SIMULATION_HAS_LINKED_ANSWERS`.
 
+As respostas de criação (`201`), detalhe (`200`), atualização (`200`) e confirmação da realização (`200`) incluem o ETag forte no cabeçalho `ETag`. Para permitir o uso exato do valor em `If-Match` no navegador, essas respostas incluem `Access-Control-Expose-Headers: ETag` somente quando a origem da solicitação já pertence à allowlist CORS. A allowlist, credenciais e política de preflight não são alteradas. A listagem e a exclusão (`204`) não retornam ETag.
+
 ## Administração de resultados
 
 Todas as rotas exigem sessão ativa de administrador, verificam turma, simulado confirmado, participante congelado e matéria pertencente àquele simulado, e respondem com `Cache-Control: no-store`.
