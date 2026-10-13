@@ -49,6 +49,16 @@ export function configuredOrigins(): string[] {
     });
 }
 
+export function etagExposureHeaders(
+  request: Pick<HttpRequest, "headers">,
+  allowedOrigins: readonly string[]
+): Record<string, string> {
+  const origin = request.headers.get("origin");
+  return origin !== null && allowedOrigins.includes(origin)
+    ? { "access-control-expose-headers": "ETag" }
+    : {};
+}
+
 export function authenticationRequired(): HttpResponseInit {
   return createProblemResponse({
     status: 401,

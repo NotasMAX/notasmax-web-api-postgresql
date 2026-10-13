@@ -211,14 +211,13 @@ export function createAdminClassHandlers(options: AdminClassHandlerOptions = {})
 
     try {
       const schoolClass = await getClass(getDatabase(), route.data.classId);
-      const origin = request.headers.get("origin");
       return schoolClass
         ? {
           status: 200,
           headers: {
             "cache-control": "no-store",
             etag: schoolClass.etag,
-            ...etagExposureHeaders(origin, allowedOrigins)
+            ...etagExposureHeaders(request.headers.get("origin"), allowedOrigins)
           },
           jsonBody: schoolClass.schoolClass
         }
