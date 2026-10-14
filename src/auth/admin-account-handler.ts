@@ -154,12 +154,12 @@ function emailAlreadyInUse(): HttpResponseInit {
 function selfEmailChangeNotAllowed(): HttpResponseInit {
   return createProblemResponse({
     status: 422,
-    title: "Conteúdo não processável",
+    title: "Dados inválidos",
     code: "VALIDATION_ERROR",
-    detail: "A alteração do próprio e-mail não é permitida neste fluxo.",
+    detail: "Você não pode alterar seu próprio e-mail institucional por aqui.",
     errors: [{
       code: "INVALID_VALUE",
-      detail: "Não é permitido alterar o próprio e-mail institucional.",
+      detail: "Você não pode alterar seu próprio e-mail institucional.",
       source: { in: "body", pointer: "/email" }
     }],
     headers: { "cache-control": "no-store" }

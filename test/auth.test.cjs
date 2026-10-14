@@ -176,7 +176,7 @@ test("bounded login streams preserve malformed JSON and ordinary validation resp
   const malformedRequest = request("POST", headers, undefined, streamFor('{"email":'));
   const malformed = await handlers.createSession(malformedRequest, noContext);
   assertProblem(malformed, 400, "VALIDATION_ERROR");
-  assert.equal(malformed.jsonBody.detail, "O corpo da requisição não contém um JSON válido.");
+  assert.equal(malformed.jsonBody.detail, "Não foi possível ler os dados enviados. Confira as informações e tente novamente.");
   assert.equal(malformedRequest.jsonCalls, 0);
 
   const invalidRequest = request("POST", headers, undefined, streamFor(JSON.stringify({
@@ -219,7 +219,7 @@ test("login rejects a declared oversized body before reading it or accessing the
     type: "about:blank",
     title: "Conteúdo muito grande",
     status: 413,
-    detail: "O corpo da requisição excede o tamanho máximo permitido."
+    detail: "Os dados enviados são muito grandes. Revise as informações e tente novamente."
   });
   assert.equal(bodyReadCount, 0);
   assert.equal(loginRequest.jsonCalls, 0);
@@ -668,7 +668,7 @@ test("unexpected database errors become sanitized RFC 9457 responses without log
 
   const body = assertProblem(response, 500);
   assert.equal(body.code, undefined);
-  assert.equal(body.detail, "Não foi possível concluir a solicitação.");
+  assert.equal(body.detail, "Tente novamente. Se o problema continuar, fale com o suporte.");
   const serialized = JSON.stringify(response);
   for (const value of privateValues) assert.equal(serialized.includes(value), false);
 });
