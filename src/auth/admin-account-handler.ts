@@ -4,6 +4,7 @@ import { z } from "zod";
 import { getKnex } from "../database/knex";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
 import { ifMatchProblem, readIfMatch } from "../http/etag";
+import { etagExposureHeaders } from "../http/cors";
 import { logDevelopmentEvent, logSecurityEvent, withSecurityEvent } from "../http/security-event";
 import {
   authenticationFailed,
@@ -483,7 +484,11 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
         ? resourceNotFound()
         : {
           status: 200,
-          headers: { "cache-control": "no-store", etag: result.etag },
+          headers: {
+            "cache-control": "no-store",
+            etag: result.etag,
+            ...etagExposureHeaders(request.headers.get("origin"), allowedOrigins)
+          },
           jsonBody: { items: result.items }
         };
     } catch {
