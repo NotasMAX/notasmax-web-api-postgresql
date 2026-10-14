@@ -62,9 +62,9 @@ export function etagExposureHeaders(
 export function authenticationRequired(): HttpResponseInit {
   return createProblemResponse({
     status: 401,
-    title: "Autenticação necessária",
+    title: "Entre na sua conta para continuar",
     code: "AUTHENTICATION_REQUIRED",
-    detail: "É necessário autenticar-se para acessar este recurso.",
+    detail: "Entre na sua conta para continuar.",
     headers: { "www-authenticate": AUTHENTICATION_CHALLENGE, "cache-control": "no-store" }
   });
 }
@@ -72,9 +72,9 @@ export function authenticationRequired(): HttpResponseInit {
 export function authenticationFailed(): HttpResponseInit {
   return createProblemResponse({
     status: 401,
-    title: "Falha de autenticação",
+    title: "Não foi possível entrar",
     code: "AUTHENTICATION_FAILED",
-    detail: "Não foi possível autenticar com as credenciais informadas.",
+    detail: "O e-mail ou a senha não conferem.",
     headers: { "www-authenticate": AUTHENTICATION_CHALLENGE, "cache-control": "no-store" }
   });
 }
@@ -82,9 +82,9 @@ export function authenticationFailed(): HttpResponseInit {
 export function resourceNotFound(): HttpResponseInit {
   return createProblemResponse({
     status: 404,
-    title: "Recurso não encontrado",
+    title: "Não encontramos o que você procura",
     code: "RESOURCE_NOT_FOUND",
-    detail: "O recurso solicitado não foi encontrado.",
+    detail: "Confira as informações e tente novamente.",
     headers: { "cache-control": "no-store" }
   });
 }
@@ -92,8 +92,8 @@ export function resourceNotFound(): HttpResponseInit {
 export function internalFailure(): HttpResponseInit {
   return createProblemResponse({
     status: 500,
-    title: "Erro interno",
-    detail: "Não foi possível concluir a solicitação.",
+    title: "Não foi possível concluir a ação",
+    detail: "Tente novamente. Se o problema continuar, fale com o suporte.",
     headers: { "cache-control": "no-store" }
   });
 }
@@ -106,9 +106,9 @@ export function mutationRejection(
   if (!origin || origin === "null" || !allowedOrigins.includes(origin)) {
     return createProblemResponse({
       status: 403,
-      title: "Origem não permitida",
+      title: "Não foi possível concluir a ação",
       code: "ORIGIN_NOT_ALLOWED",
-      detail: "A origem da solicitação não é permitida.",
+      detail: "Atualize a página e tente novamente.",
       headers: { "cache-control": "no-store" }
     });
   }
@@ -116,9 +116,9 @@ export function mutationRejection(
   if (request.headers.get("x-requested-with") !== "XMLHttpRequest") {
     return createProblemResponse({
       status: 403,
-      title: "Cabeçalho obrigatório",
+      title: "Atualize a página para continuar",
       code: "REQUEST_HEADER_REQUIRED",
-      detail: "A solicitação não contém o cabeçalho obrigatório.",
+      detail: "Atualize a página e tente novamente.",
       headers: { "cache-control": "no-store" }
     });
   }

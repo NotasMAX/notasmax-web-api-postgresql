@@ -24,11 +24,11 @@ type RequestHandler = (request: HttpRequest, context: InvocationContext) => Prom
 function mutationProblem(status: string): HttpResponseInit | undefined {
   if (status === "not-found") return resourceNotFound();
   if (status === "stale") return ifMatchProblem("stale");
-  if (status === "score-out-of-range") return createProblemResponse({ status: 422, title: "Conteúdo não processável",
-    code: "VALIDATION_ERROR", detail: "O conteúdo enviado não atende aos critérios de validação.", errors: [{ code: "VALUE_OUT_OF_RANGE",
-      detail: "O valor está fora do intervalo permitido.", source: { in: "body", pointer: "/correctAnswers" } }], headers: { "cache-control": "no-store" } });
-  if (status === "invalid-transition") return createProblemResponse({ status: 409, title: "Conflito com o estado do resultado",
-    detail: "A transição solicitada não é permitida para o estado atual do resultado.", headers: { "cache-control": "no-store" } });
+  if (status === "score-out-of-range") return createProblemResponse({ status: 422, title: "Dados inválidos",
+    code: "VALIDATION_ERROR", detail: "Confira as informações e corrija os campos indicados.", errors: [{ code: "VALUE_OUT_OF_RANGE",
+      detail: "Informe um valor dentro do limite permitido.", source: { in: "body", pointer: "/correctAnswers" } }], headers: { "cache-control": "no-store" } });
+  if (status === "invalid-transition") return createProblemResponse({ status: 409, title: "Não foi possível atualizar o resultado",
+    detail: "Esta alteração não pode ser feita neste momento.", headers: { "cache-control": "no-store" } });
   if (status === "not-realized") return createProblemResponse({ status: 409, title: "Simulado não confirmado",
     detail: "Os resultados só estão disponíveis após a confirmação da realização.", headers: { "cache-control": "no-store" } });
   return undefined;

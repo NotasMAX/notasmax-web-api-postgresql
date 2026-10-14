@@ -36,11 +36,11 @@ type JsonBodyRequest = Pick<HttpRequest, "json"> & Partial<Pick<HttpRequest, "bo
 
 const problemContentType = "application/problem+json";
 const issueDetails: Record<PublicErrorCode, string> = {
-  FIELD_REQUIRED: "Este campo é obrigatório.",
-  INVALID_TYPE: "O tipo informado é inválido.",
-  INVALID_FORMAT: "O formato informado é inválido.",
-  VALUE_OUT_OF_RANGE: "O valor está fora do intervalo permitido.",
-  INVALID_VALUE: "O valor informado é inválido."
+  FIELD_REQUIRED: "Preencha este campo.",
+  INVALID_TYPE: "Confira o valor informado.",
+  INVALID_FORMAT: "Use o formato indicado.",
+  VALUE_OUT_OF_RANGE: "Informe um valor dentro do limite permitido.",
+  INVALID_VALUE: "Escolha um valor válido."
 };
 
 function isMissingInput(input: unknown, path: PropertyKey[]): boolean {
@@ -96,7 +96,7 @@ function validationProblem(
 ): HttpResponseInit {
   return createProblemResponse({
     status,
-    title: status === 400 ? "Requisição inválida" : "Conteúdo não processável",
+    title: "Dados inválidos",
     code: "VALIDATION_ERROR",
     detail,
     errors
@@ -107,14 +107,14 @@ function oversizedRequestProblem(): HttpResponseInit {
   return createProblemResponse({
     status: 413,
     title: "Conteúdo muito grande",
-    detail: "O corpo da requisição excede o tamanho máximo permitido."
+    detail: "Os dados enviados são muito grandes. Revise as informações e tente novamente."
   });
 }
 
 function malformedJsonProblem(): HttpResponseInit {
-  return validationProblem(400, "O corpo da requisição não contém um JSON válido.", [{
+  return validationProblem(400, "Não foi possível ler os dados enviados. Confira as informações e tente novamente.", [{
     code: "INVALID_FORMAT",
-    detail: "O corpo da requisição deve conter um JSON válido.",
+    detail: "Confira as informações enviadas e tente novamente.",
     source: { in: "body", pointer: "" }
   }]);
 }
@@ -174,8 +174,8 @@ export function validateInput<Schema extends z.ZodType>(
   });
   const status = source.in === "body" ? 422 : 400;
   const detail = source.in === "body"
-    ? "O conteúdo enviado não atende aos critérios de validação."
-    : "Um ou mais parâmetros da requisição são inválidos.";
+    ? "Confira as informações e corrija os campos indicados."
+    : "Confira as informações selecionadas e tente novamente.";
   return { success: false, response: validationProblem(status, detail, errors) };
 }
 

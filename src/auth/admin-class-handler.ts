@@ -103,12 +103,12 @@ function classAlreadyExists(): HttpResponseInit {
 function classSelectionInvalid(): HttpResponseInit {
   return createProblemResponse({
     status: 409,
-    title: "Seleção de turmas inválida",
+    title: "Não foi possível encerrar as turmas escolhidas",
     code: "CLASS_SELECTION_INVALID",
-    detail: "A seleção de turmas não pôde ser aplicada. Atualize os dados e tente novamente.",
+    detail: "Atualize as informações das turmas e tente novamente.",
     errors: [{
       code: "INVALID_VALUE",
-      detail: "A seleção de turmas não pôde ser aplicada.",
+      detail: "Revise as turmas selecionadas e tente novamente.",
       source: { in: "body", pointer: "/closeClassIds" }
     }],
     headers: { "cache-control": "no-store" }
@@ -122,8 +122,8 @@ function sessionWasRevoked(error: unknown): boolean {
 function classHasLinkedData(): HttpResponseInit {
   return conflict(
     "CLASS_HAS_LINKED_DATA",
-    "Turma possui vínculos",
-    "A operação não pode ser concluída enquanto a turma possuir os vínculos definidos para esta ação."
+    "Turma em uso",
+    "Esta turma ainda tem informações associadas e não pode ser removida agora."
   );
 }
 
@@ -138,16 +138,16 @@ function classClosed(): HttpResponseInit {
 function completedSimulations(): HttpResponseInit {
   return conflict(
     "SUBJECT_HAS_COMPLETED_SIMULATIONS",
-    "Matéria vinculada a simulado realizado",
-    "Não é possível remover a matéria da turma porque ela está vinculada a um simulado realizado."
+    "Matéria usada em simulado realizado",
+    "Não é possível retirar esta matéria da turma porque ela já foi usada em um simulado realizado."
   );
 }
 
 function simulationResults(): HttpResponseInit {
   return conflict(
     "SUBJECT_HAS_SIMULATION_RESULTS",
-    "Matéria vinculada a resultados",
-    "Não é possível remover a matéria da turma porque há resultados vinculados a um simulado ainda não realizado."
+    "Há resultados para esta matéria",
+    "Não é possível retirar esta matéria da turma porque há resultados registrados para um simulado ainda não realizado."
   );
 }
 

@@ -4168,9 +4168,11 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       const enrollmentRaceClassId = await insertClass(database, { series: 3, schoolYear: nextSchoolYear(), startDate: "2026-01-01" });
       await database("turma_disciplina").insert({ id_turma: enrollmentRaceClassId, id_materia: subjectId });
       const racingStudentId = await insertStudent(database);
+      const enrollmentRaceDates = await database.raw("SELECT (CURRENT_DATE + 1)::text AS start_date");
+      const enrollmentRaceStartDate = enrollmentRaceDates.rows[0].start_date;
       const enrollmentRaceSimulation = await handlers.create(baseRequest("POST", {
         params: { classId: enrollmentRaceClassId },
-        body: { ...createBody(100), scheduledDate: "2026-10-13" }
+        body: { ...createBody(100), scheduledDate: enrollmentRaceStartDate }
       }), {});
       assert.equal(enrollmentRaceSimulation.status, 201);
       const enrollmentRaceItem = await handlers.get(baseRequest("GET", {
@@ -4180,7 +4182,8 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       await userBlocker("usuario").select("id_usuario").where({ id_usuario: racingStudentId }).forUpdate().first();
       const enrollmentHandlers = adminEnrollmentHandlers(database);
       const enrolling = enrollmentHandlers.createEnrollment(baseRequest("POST", {
-        params: { classId: enrollmentRaceClassId }, body: { studentId: String(racingStudentId), startDate: "2026-10-13" }
+        params: { classId: enrollmentRaceClassId },
+        body: { studentId: String(racingStudentId), startDate: enrollmentRaceStartDate }
       }), {});
       let confirming;
       let blockerReleased = false;

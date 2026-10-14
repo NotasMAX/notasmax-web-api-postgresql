@@ -27,23 +27,23 @@ export function ifMatchProblem(status: "missing" | "malformed" | "stale"): HttpR
   if (status === "missing") {
     return createProblemResponse({
       status: 428,
-      title: "Pré-condição necessária",
-      detail: "Envie o ETag atual no cabeçalho If-Match.",
+      title: "Atualização necessária",
+      detail: "Atualize os dados da página e tente novamente.",
       headers: { "cache-control": "no-store" }
     });
   }
   if (status === "malformed") {
     return createProblemResponse({
       status: 400,
-      title: "Cabeçalho If-Match inválido",
-      detail: "Envie exatamente um ETag forte no cabeçalho If-Match.",
+      title: "Não foi possível concluir a atualização",
+      detail: "Atualize os dados da página e tente novamente.",
       headers: { "cache-control": "no-store" }
     });
   }
   return createProblemResponse({
     status: 412,
-    title: "Pré-condição não satisfeita",
-    detail: "O recurso mudou desde a última leitura. Atualize os dados antes de tentar novamente.",
+    title: "Os dados foram alterados",
+    detail: "Atualize a página e tente novamente.",
     headers: { "cache-control": "no-store" }
   });
 }

@@ -43,17 +43,17 @@ const querySchema = z.strictObject({
 }).refine((value) => !value.fromDate || !value.toDate || value.fromDate <= value.toDate);
 type RequestHandler = (request: HttpRequest, context: InvocationContext) => Promise<HttpResponseInit>;
 function conflict(detail: string, code?: string): HttpResponseInit {
-  return createProblemResponse({ status: 409, title: "Conflito com o estado do simulado", ...(code ? { code } : {}), detail,
+  return createProblemResponse({ status: 409, title: "Não foi possível alterar o simulado", ...(code ? { code } : {}), detail,
     headers: { "cache-control": "no-store" } });
 }
 function mutationResult(status: string): HttpResponseInit | undefined {
   if (status === "not-found") return resourceNotFound();
   if (status === "class-closed") return conflict("A operação não pode ser concluída porque a turma está fechada.", "CLASS_CLOSED");
   if (status === "stale") return ifMatchProblem("stale");
-  if (status === "invalid-subjects") return conflict("A seleção deve conter somente matérias oferecidas e ativas na turma.");
+  if (status === "invalid-subjects") return conflict("Escolha matérias disponíveis para esta turma.");
   if (status === "weight-exceeded") return conflict("A soma dos pesos da matéria no bimestre não pode ultrapassar 100%.");
   if (status === "realized") return conflict("O simulado já teve a realização confirmada.");
-  if (status === "has-linked-answers") return conflict("O simulado confirmado ou vinculado a resultados não pode ser excluído.", "SIMULATION_HAS_LINKED_ANSWERS");
+  if (status === "has-linked-answers") return conflict("Este simulado não pode ser removido porque já foi realizado ou tem resultados registrados.", "SIMULATION_HAS_LINKED_ANSWERS");
   return undefined;
 }
 export type AdminSimulationHandlerOptions = { getDatabase?: () => Knex; allowedOrigins?: readonly string[] };

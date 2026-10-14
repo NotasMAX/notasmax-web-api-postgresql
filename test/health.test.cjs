@@ -132,13 +132,13 @@ test("400 validation problems use the localized Bad Request title", () => {
     name: "userId"
   });
 
-  assert.equal(assertValidationProblem(result, 400).title, "Requisição inválida");
+  assert.equal(assertValidationProblem(result, 400).title, "Dados inválidos");
 });
 
 test("422 validation problems use the localized Unprocessable Content title", () => {
   const result = validateInput(z.string().min(2), "x", { in: "body" });
 
-  assert.equal(assertValidationProblem(result, 422).title, "Conteúdo não processável");
+  assert.equal(assertValidationProblem(result, 422).title, "Dados inválidos");
 });
 
 test("shared validation accepts valid route, query, and JSON body inputs", async () => {
@@ -175,10 +175,10 @@ test("malformed JSON returns a sanitized 400 problem with a body source", async 
   }, z.object({ name: z.string() }));
   const problem = assertValidationProblem(result, 400);
 
-  assert.equal(problem.detail, "O corpo da requisição não contém um JSON válido.");
+  assert.equal(problem.detail, "Não foi possível ler os dados enviados. Confira as informações e tente novamente.");
   assert.deepEqual(problem.errors, [{
     code: "INVALID_FORMAT",
-    detail: "O corpo da requisição deve conter um JSON válido.",
+    detail: "Confira as informações enviadas e tente novamente.",
     source: { in: "body", pointer: "" }
   }]);
   const serialized = JSON.stringify(result.response);
@@ -196,7 +196,7 @@ test("invalid route and query formats or types return 400 with parameter names",
   const routeProblem = assertValidationProblem(route, 400);
   assert.deepEqual(routeProblem.errors[0], {
     code: "INVALID_FORMAT",
-    detail: "O formato informado é inválido.",
+    detail: "Use o formato indicado.",
     source: { in: "path", name: "userId" }
   });
 
@@ -216,7 +216,7 @@ test("invalid route and query formats or types return 400 with parameter names",
   const queryProblem = assertValidationProblem(query, 400);
   assert.deepEqual(queryProblem.errors[0], {
     code: "INVALID_TYPE",
-    detail: "O tipo informado é inválido.",
+    detail: "Confira o valor informado.",
     source: { in: "query", name: "limit" }
   });
 
@@ -313,7 +313,7 @@ test("multiple body failures use escaped JSON Pointers and sanitized Portuguese 
   }, schema);
   const problem = assertValidationProblem(result, 422);
 
-  assert.equal(problem.detail, "O conteúdo enviado não atende aos critérios de validação.");
+  assert.equal(problem.detail, "Confira as informações e corrija os campos indicados.");
   assert.deepEqual(problem.errors.map((error) => error.code), [
     "INVALID_FORMAT",
     "VALUE_OUT_OF_RANGE",
@@ -324,7 +324,11 @@ test("multiple body failures use escaped JSON Pointers and sanitized Portuguese 
     { in: "body", pointer: "/age" },
     { in: "body", pointer: "/token" }
   ]);
-  assert.ok(problem.errors.every((error) => /[áéíóúãõç]/i.test(error.detail)));
+  assert.deepEqual(problem.errors.map((error) => error.detail), [
+    "Use o formato indicado.",
+    "Informe um valor dentro do limite permitido.",
+    "Escolha um valor válido."
+  ]);
 
   const serialized = JSON.stringify(result.response);
   for (const secret of [sensitiveValue, "private-token", rawLibraryMessage, "invalid_format", "custom", "SQL", "password=internal-secret"]) {
@@ -343,7 +347,7 @@ test("unknown Zod issue classes use INVALID_VALUE without exposing keys or messa
 
   assert.deepEqual(problem.errors, [{
     code: "INVALID_VALUE",
-    detail: "O valor informado é inválido.",
+    detail: "Escolha um valor válido.",
     source: { in: "body", pointer: "" }
   }]);
   const serialized = JSON.stringify(result.response);

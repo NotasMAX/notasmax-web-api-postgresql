@@ -80,8 +80,8 @@ function subjectAlreadyExists(): HttpResponseInit {
 function subjectHasClassLinks(): HttpResponseInit {
   return conflict(
     "SUBJECT_HAS_CLASS_LINKS",
-    "Matéria possui vínculos",
-    "Remova os vínculos com turmas antes de excluir a matéria."
+    "Matéria usada em turmas",
+    "Retire esta matéria das turmas antes de excluí-la."
   );
 }
 

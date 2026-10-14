@@ -127,12 +127,12 @@ function previousYearEnrollmentCannotBeRenewed(): HttpResponseInit {
 function invalidStartDate(): HttpResponseInit {
   return createProblemResponse({
     status: 422,
-    title: "Conteúdo não processável",
+    title: "Dados inválidos",
     code: "VALIDATION_ERROR",
-    detail: "O conteúdo enviado não atende aos critérios de validação.",
+    detail: "Confira as informações e corrija os campos indicados.",
     errors: [{
       code: "INVALID_VALUE",
-      detail: "A data de início deve ser hoje ou futura em America/Sao_Paulo.",
+      detail: "A data de início deve ser hoje ou uma data futura.",
       source: { in: "body", pointer: "/startDate" }
     }],
     headers: { "cache-control": "no-store" }
@@ -142,9 +142,9 @@ function invalidStartDate(): HttpResponseInit {
 function invalidClassStartDate(): HttpResponseInit {
   return createProblemResponse({
     status: 422,
-    title: "Conteúdo não processável",
+    title: "Dados inválidos",
     code: "VALIDATION_ERROR",
-    detail: "O conteúdo enviado não atende aos critérios de validação.",
+    detail: "Confira as informações e corrija os campos indicados.",
     errors: [{
       code: "INVALID_VALUE",
       detail: "A data de início não pode anteceder o início da turma.",
@@ -167,9 +167,9 @@ function alreadyCancelled(): HttpResponseInit {
 function invalidCancellationDate(pointer: string, detail: string): HttpResponseInit {
   return createProblemResponse({
     status: 422,
-    title: "Conteúdo não processável",
+    title: "Dados inválidos",
     code: "VALIDATION_ERROR",
-    detail: "O conteúdo enviado não atende aos critérios de validação.",
+    detail: "Confira as informações e corrija os campos indicados.",
     errors: [{
       code: "INVALID_VALUE",
       detail,
@@ -301,7 +301,7 @@ export function createAdminEnrollmentHandlers(options: AdminEnrollmentHandlerOpt
       if (result.status === "date-before-today") {
         return invalidCancellationDate(
           "/cancellationDate",
-          "A data efetiva do cancelamento deve ser hoje ou futura em America/Sao_Paulo."
+          "A data do cancelamento deve ser hoje ou uma data futura."
         );
       }
       if (result.status === "date-not-after-start") {
