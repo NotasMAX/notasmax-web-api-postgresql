@@ -4,6 +4,16 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { resultScore, weightedContribution, provisionalAverage } = require("../dist/auth/result-calculations.js");
 const { createAdminResultHandlers } = require("../dist/auth/admin-result-handler.js");
+const { etagExposureHeaders } = require("../dist/http/cors.js");
+
+test("ETag exposure is limited to an exact allowed Origin", () => {
+  const allowedOrigins = ["http://localhost:5173"];
+  assert.deepEqual(etagExposureHeaders("http://localhost:5173", allowedOrigins), {
+    "access-control-expose-headers": "ETag"
+  });
+  assert.deepEqual(etagExposureHeaders("http://localhost:5174", allowedOrigins), {});
+  assert.deepEqual(etagExposureHeaders(null, allowedOrigins), {});
+});
 
 test("result calculations preserve full precision and distinguish pending, absence, and zero", () => {
   assert.equal(resultScore("pending", null, 10), null);

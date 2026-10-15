@@ -2,10 +2,11 @@ import type { HttpRequest, HttpResponseInit, InvocationContext } from "@azure/fu
 import type { Knex } from "knex";
 import { z } from "zod";
 import { getKnex } from "../database/knex";
+import { etagExposureHeaders } from "../http/cors";
 import { ifMatchProblem, readIfMatch } from "../http/etag";
 import { withSecurityEvent } from "../http/security-event";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
-import { authenticationRequired, configuredOrigins, etagExposureHeaders, internalFailure, mutationRejection, requireAdminSession, resourceNotFound } from "./handler";
+import { authenticationRequired, configuredOrigins, internalFailure, mutationRejection, requireAdminSession, resourceNotFound } from "./handler";
 import { confirmSimulation, createSimulation, deleteSimulation, getSimulation, listSimulations, updateSimulation,
   type SimulationInput, type SimulationPatch, type SimulationQuery } from "./admin-simulation-service";
 
@@ -82,7 +83,7 @@ export function createAdminSimulationHandlers(options: AdminSimulationHandlerOpt
     try {
       const result = await getSimulation(getDatabase(), route.data.classId, route.data.simulationId);
       return result ? { status: 200, headers: { "cache-control": "no-store", etag: result.etag,
-        ...etagExposureHeaders(request, origins) }, jsonBody: result.simulation } : resourceNotFound();
+        ...etagExposureHeaders(request.headers.get("origin"), origins) }, jsonBody: result.simulation } : resourceNotFound();
     } catch { return internalFailure(); }
   };
   const create: RequestHandler = withSecurityEvent("admin_simulation_create", async (request) => {
@@ -97,7 +98,7 @@ export function createAdminSimulationHandlers(options: AdminSimulationHandlerOpt
       const problem = mutationResult(result.status); if (problem) return problem;
       if (result.status !== "created") return internalFailure();
       return { status: 201, headers: { "cache-control": "no-store", etag: result.etag,
-        ...etagExposureHeaders(request, origins) }, jsonBody: result.simulation };
+        ...etagExposureHeaders(request.headers.get("origin"), origins) }, jsonBody: result.simulation };
     } catch (error) { return error instanceof Error && error.name === "AdminSessionRevokedError" ? authenticationRequired() : internalFailure(); }
   });
   const update: RequestHandler = withSecurityEvent("admin_simulation_update", async (request) => {
@@ -113,7 +114,7 @@ export function createAdminSimulationHandlers(options: AdminSimulationHandlerOpt
       const problem = mutationResult(result.status); if (problem) return problem;
       if (result.status !== "ok") return internalFailure();
       return { status: 200, headers: { "cache-control": "no-store", etag: result.etag,
-        ...etagExposureHeaders(request, origins) }, jsonBody: result.simulation };
+        ...etagExposureHeaders(request.headers.get("origin"), origins) }, jsonBody: result.simulation };
     } catch (error) { return error instanceof Error && error.name === "AdminSessionRevokedError" ? authenticationRequired() : internalFailure(); }
   });
   const confirm: RequestHandler = withSecurityEvent("admin_simulation_confirm", async (request) => {
@@ -127,7 +128,7 @@ export function createAdminSimulationHandlers(options: AdminSimulationHandlerOpt
       const problem = mutationResult(result.status); if (problem) return problem;
       if (result.status !== "ok") return internalFailure();
       return { status: 200, headers: { "cache-control": "no-store", etag: result.etag,
-        ...etagExposureHeaders(request, origins) }, jsonBody: result.simulation };
+        ...etagExposureHeaders(request.headers.get("origin"), origins) }, jsonBody: result.simulation };
     } catch (error) { return error instanceof Error && error.name === "AdminSessionRevokedError" ? authenticationRequired() : internalFailure(); }
   });
   const remove: RequestHandler = withSecurityEvent("admin_simulation_delete", async (request) => {

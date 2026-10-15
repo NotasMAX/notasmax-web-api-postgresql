@@ -4230,8 +4230,8 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
         id_turma: classId, id_materia: subjectId, estado: "pendente", acertos: null },
       { id_simulado: simulationId, id_usuario_aluno: secondStudentId,
         id_turma: classId, id_materia: subjectId, estado: "pendente", acertos: null }]);
-      const req = (method, { params, query, body, ifMatch } = {}) => accountRequest(method, {
-        cookie: token, params, query, body, ifMatch
+      const req = (method, { params, query, body, ifMatch, origin } = {}) => accountRequest(method, {
+        cookie: token, params, query, body, ifMatch, origin
       });
       const nonAdminToken = await insertAuthSession(database, secondStudentId);
       const path = { classId, simulationId, studentId, subjectId };
@@ -4263,7 +4263,20 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       const repeated = await handlers.get(req("GET", { params: path }), {});
       assert.equal(initial.status, 200);
       assert.equal(initial.headers.etag.startsWith('"'), true);
+      assert.equal(initial.headers["access-control-expose-headers"], "ETag");
       assert.equal(repeated.headers.etag, initial.headers.etag);
+      const unapprovedOriginDetail = await handlers.get(req("GET", {
+        params: path, origin: "https://unapproved.example"
+      }), {});
+      assert.equal(unapprovedOriginDetail.status, 200);
+      assert.equal(unapprovedOriginDetail.headers.etag, initial.headers.etag);
+      assert.equal(unapprovedOriginDetail.headers["access-control-expose-headers"], undefined);
+      const unapprovedOriginPatch = await handlers.patch(req("PATCH", {
+        params: path, body: { status: "absent" }, ifMatch: initial.headers.etag,
+        origin: "https://unapproved.example"
+      }), {});
+      assertProblemResponse(unapprovedOriginPatch, 403, "ORIGIN_NOT_ALLOWED");
+      assert.equal(unapprovedOriginPatch.headers["access-control-expose-headers"], undefined);
       assert.equal(initial.jsonBody.weightedContribution, null);
       assertProblemResponse(await handlers.get(req("GET", { params: { ...path, classId: otherClassId } }), {}), 404, "RESOURCE_NOT_FOUND");
       const wrongClassPatch = await handlers.patch(req("PATCH", {
@@ -4278,6 +4291,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assertProblemResponse(await handlers.patch(req("PATCH", { params: path, body: { status: "absent" }, ifMatch: 'W/"weak"' }), {}), 400);
       const absent = await handlers.patch(req("PATCH", { params: path, body: { status: "absent" }, ifMatch: initial.headers.etag }), {});
       assert.equal(absent.status, 200);
+      assert.equal(absent.headers["access-control-expose-headers"], "ETag");
       assert.equal(absent.jsonBody.score, 0);
       assert.equal(absent.jsonBody.correctAnswers, null);
       assertProblemResponse(await handlers.patch(req("PATCH", { params: path, body: { status: "absent" }, ifMatch: initial.headers.etag }), {}), 412);

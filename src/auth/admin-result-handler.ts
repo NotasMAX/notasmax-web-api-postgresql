@@ -2,6 +2,7 @@ import type { HttpRequest, HttpResponseInit, InvocationContext } from "@azure/fu
 import type { Knex } from "knex";
 import { z } from "zod";
 import { getKnex } from "../database/knex";
+import { etagExposureHeaders } from "../http/cors";
 import { ifMatchProblem, readIfMatch } from "../http/etag";
 import { withSecurityEvent } from "../http/security-event";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
@@ -48,7 +49,8 @@ export function createAdminResultHandlers(options: { getDatabase?: () => Knex; a
     const route = validateInput(resultPath, request.params, { in: "path" }); if (!route.success) return route.response;
     const auth = await requireAdminSession(request, getDatabase); if (!auth.authorized) return auth.response;
     try { const result = await getResult(getDatabase(), route.data.classId, route.data.simulationId, route.data.studentId, route.data.subjectId);
-      return result ? { status: 200, headers: { "cache-control": "no-store", etag: result.etag }, jsonBody: result.result } : resourceNotFound();
+      return result ? { status: 200, headers: { "cache-control": "no-store", etag: result.etag,
+        ...etagExposureHeaders(request.headers.get("origin"), origins) }, jsonBody: result.result } : resourceNotFound();
     } catch { return internalFailure(); }
   };
   const patch: RequestHandler = withSecurityEvent("admin_result_update", async (request) => {
@@ -63,7 +65,8 @@ export function createAdminResultHandlers(options: { getDatabase?: () => Knex; a
       precondition.value, { actorId: auth.user.id, token: auth.token });
       const problem = mutationProblem(result.status); if (problem) return problem;
       if (result.status !== "ok") return internalFailure();
-      return { status: 200, headers: { "cache-control": "no-store", etag: result.etag }, jsonBody: result.result };
+      return { status: 200, headers: { "cache-control": "no-store", etag: result.etag,
+        ...etagExposureHeaders(request.headers.get("origin"), origins) }, jsonBody: result.result };
     } catch (error) { return error instanceof AdminSessionRevokedError ? authenticationRequired() : internalFailure(); }
   });
   return { list, get, patch };
