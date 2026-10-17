@@ -459,7 +459,7 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       extension: "js"
     });
     assert.equal(batch, 1);
-    assert.equal(migrations.length, 6);
+    assert.equal(migrations.length, 7);
 
     for (const connection of [database, secondConnection]) {
       const timeZone = await connection.raw("SELECT current_setting('TimeZone') AS time_zone");
@@ -2972,6 +2972,67 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.equal(immediateStartUnchanged.fim_vigencia, null);
       assert.equal(immediateStartUnchanged.cancelada_em, null);
 
+      const preStartStudent = await insertStudent(database);
+      const preStartClass = await insertClass(database);
+      const [preStartEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: preStartStudent,
+        id_turma: preStartClass,
+        inicio_vigencia: tomorrow
+      }).returning("id_matricula");
+      const preStartPath = { enrollmentId: String(preStartEnrollment.id_matricula) };
+      const preStartBefore = await handlers.getEnrollment(accountRequest("GET", {
+        cookie: adminToken, params: preStartPath
+      }), context);
+      assert.equal(preStartBefore.status, 200);
+      assert.equal(preStartBefore.jsonBody.cancellationDate, null);
+      assert.equal(preStartBefore.jsonBody.cancellationRequestedAt, null);
+      const cancelledBeforeStart = await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: preStartPath,
+        body: {},
+        ifMatch: preStartBefore.headers.etag
+      }), context);
+      assert.equal(cancelledBeforeStart.status, 204);
+      const preStartRow = await database("matricula")
+        .select("fim_vigencia", "cancelada_em")
+        .where({ id_matricula: preStartEnrollment.id_matricula }).first();
+      assert.equal(preStartRow.fim_vigencia, null);
+      assert.ok(preStartRow.cancelada_em);
+      const preStartAfter = await handlers.getEnrollment(accountRequest("GET", {
+        cookie: adminToken, params: preStartPath
+      }), context);
+      assert.equal(preStartAfter.jsonBody.cancellationDate, null);
+      assert.ok(preStartAfter.jsonBody.cancellationRequestedAt);
+      assert.notEqual(preStartAfter.headers.etag, preStartBefore.headers.etag);
+      const preStartAccount = await adminAccountHandlers(database, { async send() {} })
+        .getStudent(accountRequest("GET", {
+          cookie: adminToken, params: { studentId: String(preStartStudent) }
+        }), context);
+      assert.equal(preStartAccount.jsonBody.enrollmentStatus, "no_active_enrollment");
+      assert.equal(preStartAccount.jsonBody.enrollments[0].cancellationDate, null);
+      assert.ok(preStartAccount.jsonBody.enrollments[0].cancellationRequestedAt);
+      assert.equal(await database("matricula as m")
+        .select("m.id_matricula")
+        .where("m.id_matricula", preStartEnrollment.id_matricula)
+        .whereRaw(effectiveEnrollmentPredicate("m", "?::date"), [tomorrow, tomorrow])
+        .first(), undefined);
+      const [replacementEnrollment] = await database("matricula").insert({
+        id_usuario_aluno: preStartStudent,
+        id_turma: await insertClass(database),
+        inicio_vigencia: tomorrow
+      }).returning("id_matricula");
+      assert.ok(replacementEnrollment.id_matricula);
+
+      assertProblemResponse(await handlers.cancelEnrollment(accountRequest("POST", {
+        cookie: adminToken,
+        params: { enrollmentId: String(immediateStartEnrollment.id_matricula) },
+        body: {},
+        ifMatch: (await handlers.getEnrollment(accountRequest("GET", {
+          cookie: adminToken,
+          params: { enrollmentId: String(immediateStartEnrollment.id_matricula) }
+        }), context)).headers.etag
+      }), context), 422, "VALIDATION_ERROR");
+
       const scheduledStudent = await insertStudent(database);
       const scheduledClass = await insertClass(database);
       const [scheduledEnrollment] = await database("matricula").insert({
@@ -3115,15 +3176,31 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       const records = logs.map((line) => JSON.parse(line));
       assert.ok(records.every((record) => record.event === "admin_enrollment_cancel"
         || record.event === "admin_class_close"));
+      const cancellationAudits = records.filter((record) =>
+        record.event === "admin_enrollment_cancel" && record.result === "completed");
+      assert.ok(cancellationAudits.some((record) => record.cancellationMode === "immediate"));
+      assert.ok(cancellationAudits.some((record) => record.cancellationMode === "date_based"));
       for (const record of records) {
-        assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
         assert.equal(record.invocationId, "synthetic-enrollment-cancel");
+        if (record.event === "admin_enrollment_cancel" && record.result === "completed") {
+          assert.deepEqual(Object.keys(record).sort(), [
+            "actorId", "cancellationMode", "enrollmentId", "event", "invocationId", "result"
+          ]);
+          assert.equal(record.actorId, String(administrator.id));
+          assert.ok(["immediate", "date_based"].includes(record.cancellationMode));
+        } else {
+          assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
+        }
       }
-      const serializedLogText = records.flatMap((record) => [record.event, record.invocationId, record.result]).join(" ");
-      for (const sensitiveValue of [
-        String(studentId), String(enrollment.id_matricula), String(scheduledStudent),
-        "synthetic-sensitive-enrollment-database-error"
-      ]) assert.equal(serializedLogText.includes(sensitiveValue), false);
+      for (const record of records) {
+        assert.equal(Object.hasOwn(record, "studentId"), false);
+        assert.equal(Object.hasOwn(record, "body"), false);
+        assert.equal(Object.hasOwn(record, "headers"), false);
+        assert.equal(Object.hasOwn(record, "token"), false);
+      }
+      const serializedLogText = JSON.stringify(records);
+      assert.equal(serializedLogText.includes(adminToken), false);
+      assert.equal(serializedLogText.includes("synthetic-sensitive-enrollment-database-error"), false);
     });
 
     await t.test("subject offers are idempotent, preserve results, and remove related state atomically", async () => {

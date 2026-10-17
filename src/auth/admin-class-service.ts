@@ -199,6 +199,7 @@ export async function createClass(
         .distinct("id_usuario_aluno")
         .whereIn("id_turma", classIds)
         .whereRaw("(fim_vigencia IS NULL OR fim_vigencia > CURRENT_DATE)")
+        .whereRaw("(fim_vigencia IS NOT NULL OR cancelada_em IS NULL)")
         .orderBy("id_usuario_aluno", "asc") as Array<{ id_usuario_aluno: string | number }>;
       const teacherRows = classIds.length === 0 ? [] : await transaction("turma_disciplina_professor as tdp")
         .join("turma_disciplina as td", "td.id_turma_disciplina", "tdp.id_turma_disciplina")
@@ -309,6 +310,7 @@ export async function closeClass(
     const studentRows = await transaction("matricula").distinct("id_usuario_aluno")
       .where({ id_turma: classId })
       .whereRaw("(fim_vigencia IS NULL OR fim_vigencia > CURRENT_DATE)")
+      .whereRaw("(fim_vigencia IS NOT NULL OR cancelada_em IS NULL)")
       .orderBy("id_usuario_aluno", "asc") as Array<{ id_usuario_aluno: string | number }>;
     const teacherRows = await transaction("turma_disciplina_professor as tdp")
       .join("turma_disciplina as td", "td.id_turma_disciplina", "tdp.id_turma_disciplina")

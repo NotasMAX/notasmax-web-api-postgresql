@@ -7,6 +7,28 @@ type SecurityEventHandler = (
 
 type ApplicationLogValue = string | number | readonly string[];
 
+export function logAdminEnrollmentCancellationAudit(
+  context: InvocationContext,
+  fields: {
+    actorId: string | number;
+    enrollmentId: string;
+    cancellationMode: "immediate" | "date_based";
+  }
+): void {
+  try {
+    context.log(JSON.stringify({
+      event: "admin_enrollment_cancel",
+      actorId: fields.actorId,
+      enrollmentId: fields.enrollmentId,
+      cancellationMode: fields.cancellationMode,
+      result: "completed",
+      invocationId: context.invocationId
+    }));
+  } catch {
+    // Audit logging is best-effort and must not change a completed operation.
+  }
+}
+
 export function logDevelopmentEvent(
   context: InvocationContext,
   fields: Record<string, ApplicationLogValue>
@@ -34,7 +56,11 @@ export function logSecurityEvent(
   });
 }
 
-export function withSecurityEvent(event: string, handler: SecurityEventHandler): SecurityEventHandler {
+export function withSecurityEvent(
+  event: string,
+  handler: SecurityEventHandler,
+  options: { suppressCompleted?: boolean } = {}
+): SecurityEventHandler {
   return async (request, context) => {
     const startedAt = Date.now();
     let result = "failed";
@@ -44,7 +70,9 @@ export function withSecurityEvent(event: string, handler: SecurityEventHandler):
       result = status >= 500 ? "failed" : status >= 400 ? "rejected" : "completed";
       return response;
     } finally {
-      logSecurityEvent(context, event, result, startedAt);
+      if (!options.suppressCompleted || result !== "completed") {
+        logSecurityEvent(context, event, result, startedAt);
+      }
     }
   };
 }

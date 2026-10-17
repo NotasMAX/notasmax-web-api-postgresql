@@ -121,7 +121,8 @@ test("each Knex down handler fails before performing schema changes", async () =
   const migrations = [
     require("../migrations/202610080001_accounts_and_identity.js"),
     require("../migrations/202610080002_academic_domain.js"),
-    require("../migrations/202610080003_assessments_and_results.js")
+    require("../migrations/202610080003_assessments_and_results.js"),
+    require("../migrations/202610150001_cancel_future_enrollment_immediately.js")
   ];
 
   for (const migration of migrations) {
@@ -133,7 +134,8 @@ test("migration and seed entry points reject non-loopback hosts before database 
   const migrationPaths = [
     "../migrations/202610080001_accounts_and_identity.js",
     "../migrations/202610080002_academic_domain.js",
-    "../migrations/202610080003_assessments_and_results.js"
+    "../migrations/202610080003_assessments_and_results.js",
+    "../migrations/202610150001_cancel_future_enrollment_immediately.js"
   ];
   for (const migrationPath of migrationPaths) {
     const migration = require(migrationPath);

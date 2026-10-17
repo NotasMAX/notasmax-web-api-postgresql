@@ -17,6 +17,7 @@ export type EnrollmentRepresentation = {
   classId: string;
   startDate: string;
   cancellationDate: string | null;
+  cancellationRequestedAt: string | null;
 };
 
 export type CreateEnrollmentResult =
@@ -52,7 +53,12 @@ function representation(row: EnrollmentRow): EnrollmentRepresentation {
     studentId: String(row.id_usuario_aluno),
     classId: String(row.id_turma),
     startDate: String(row.inicio_vigencia),
-    cancellationDate: row.fim_vigencia === null ? null : String(row.fim_vigencia)
+    cancellationDate: row.fim_vigencia === null ? null : String(row.fim_vigencia),
+    cancellationRequestedAt: row.cancelada_em === null
+      ? null
+      : row.cancelada_em instanceof Date
+        ? row.cancelada_em.toISOString()
+        : String(row.cancelada_em)
   };
 }
 
@@ -225,6 +231,7 @@ export type CancelEnrollmentResult =
   | { status: "class-closed" }
   | { status: "date-before-today" }
   | { status: "date-not-after-start" }
+  | { status: "date-required" }
   | { status: "etag-stale" };
 
 type EnrollmentReference = { id_usuario_aluno: string | number; id_turma: string | number };
@@ -232,7 +239,7 @@ type EnrollmentReference = { id_usuario_aluno: string | number; id_turma: string
 export async function cancelEnrollment(
   knex: Knex,
   enrollmentId: string,
-  cancellationDate: string,
+  cancellationDate: string | undefined,
   ifMatch: string,
   actor: MutationActor
 ): Promise<CancelEnrollmentResult> {
@@ -280,13 +287,17 @@ export async function cancelEnrollment(
 
     const dateResult = await transaction.raw("SELECT CURRENT_DATE::text AS business_date");
     const businessDate = String(dateResult.rows[0].business_date);
-    if (cancellationDate < businessDate) {
+    if (cancellationDate !== undefined && cancellationDate < businessDate) {
       await authorizeAndLockSessions(transaction, actor);
       return { status: "date-before-today" };
     }
-    if (cancellationDate <= enrollment.inicio_vigencia) {
+    if (cancellationDate !== undefined && cancellationDate <= enrollment.inicio_vigencia) {
       await authorizeAndLockSessions(transaction, actor);
       return { status: "date-not-after-start" };
+    }
+    if (cancellationDate === undefined && enrollment.inicio_vigencia <= businessDate) {
+      await authorizeAndLockSessions(transaction, actor);
+      return { status: "date-required" };
     }
 
     const sessions = await lockAdminMutationSessions(transaction, actor.token, actor.actorId, [userId]);
@@ -296,7 +307,7 @@ export async function cancelEnrollment(
       .whereNull("fim_vigencia")
       .whereNull("cancelada_em")
       .update({
-        fim_vigencia: cancellationDate,
+        ...(cancellationDate === undefined ? {} : { fim_vigencia: cancellationDate }),
         cancelada_em: transaction.raw("clock_timestamp()")
       });
     if (updated !== 1) return { status: "already-closed" };

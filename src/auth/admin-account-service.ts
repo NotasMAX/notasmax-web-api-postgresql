@@ -202,6 +202,7 @@ export async function accountDetail(
       "m.id_matricula",
       knex.raw("m.inicio_vigencia::text AS inicio_vigencia"),
       knex.raw("m.fim_vigencia::text AS fim_vigencia"),
+      "m.cancelada_em",
       "t.serie",
       "t.ano_letivo",
       knex.raw(`(${effectiveEnrollmentPredicate("m")} AND t.fechada_em IS NULL) AS is_effective`)
@@ -224,7 +225,10 @@ export async function accountDetail(
       enrollmentId: String(enrollment.id_matricula),
       class: { series: Number(enrollment.serie), schoolYear: Number(enrollment.ano_letivo) },
       startDate: enrollment.inicio_vigencia,
-      cancellationDate: enrollment.fim_vigencia
+      cancellationDate: enrollment.fim_vigencia,
+      cancellationRequestedAt: enrollment.cancelada_em instanceof Date
+        ? enrollment.cancelada_em.toISOString()
+        : enrollment.cancelada_em === null ? null : String(enrollment.cancelada_em)
     }))
   };
 }

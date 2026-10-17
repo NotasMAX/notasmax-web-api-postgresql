@@ -1,11 +1,13 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { createHash } = require("node:crypto");
 const { test } = require("node:test");
 const { createAdminClassHandlers } = require("../dist/auth/admin-class-handler.js");
 const { getClass, listClasses } = require("../dist/auth/admin-class-service.js");
 const { createAdminEnrollmentHandlers } = require("../dist/auth/admin-enrollment-handler.js");
 const { createEnrollment } = require("../dist/auth/admin-enrollment-service.js");
+const { strongEtag } = require("../dist/http/etag.js");
 
 const allowedOrigin = "http://localhost:5173";
 
@@ -31,6 +33,101 @@ function assertProblem(response, status, code) {
   assert.equal(response.jsonBody.status, status);
   if (code !== undefined) assert.equal(response.jsonBody.code, code);
   return response.jsonBody;
+}
+
+function cancellationKnex({ actorId, token, studentId, classId, enrollmentId, startDate }) {
+  const now = new Date("2026-10-15T12:00:00.000Z");
+  const session = {
+    id_sessao: "51",
+    id_usuario: actorId,
+    expira_em: new Date("2027-01-01T00:00:00.000Z"),
+    expira_absoluta_em: new Date("2027-01-01T00:00:00.000Z"),
+    hash_token_sha256: createHash("sha256").update(token).digest()
+  };
+  const administrator = {
+    id_usuario: actorId,
+    tipo_perfil: "administrador",
+    nome_completo: "Synthetic Administrator",
+    hash_senha: "synthetic-hash",
+    ativado_em: new Date("2026-01-01T00:00:00.000Z"),
+    excluido_em: null,
+    falhas_login_na_janela: 0,
+    inicio_janela_falhas_login: null,
+    bloqueado_ate: null
+  };
+  let sessionFirstCalls = 0;
+  let userFirstCalls = 0;
+  let enrollmentFirstCalls = 0;
+  let enrollmentUpdated = false;
+  let cancellationCommitted = false;
+
+  const transaction = (table) => {
+    let isSessionList = false;
+    const query = {
+      select() { return this; },
+      join() { return this; },
+      where() { return this; },
+      whereNull() { return this; },
+      whereRaw() { return this; },
+      whereIn() { isSessionList = true; return this; },
+      orderBy() { return this; },
+      forUpdate() { return this; },
+      forShare() { return this; },
+      async first() {
+        if (table === "sessao") {
+          sessionFirstCalls += 1;
+          return sessionFirstCalls === 1
+            ? { id_sessao: session.id_sessao, id_usuario: actorId }
+            : sessionFirstCalls === 2 ? session : undefined;
+        }
+        if (table === "usuario") {
+          userFirstCalls += 1;
+          if (userFirstCalls === 1 || userFirstCalls === 5) return administrator;
+          if (userFirstCalls === 4) return { id_usuario: studentId, tipo_perfil: "aluno" };
+          return undefined;
+        }
+        if (table === "aluno") return { id_usuario: studentId };
+        if (table === "turma") return { id_turma: classId, fechada_em: null };
+        if (table === "matricula") {
+          enrollmentFirstCalls += 1;
+          return enrollmentFirstCalls === 1
+            ? { id_usuario_aluno: studentId, id_turma: classId }
+            : {
+              id_matricula: enrollmentId,
+              id_usuario_aluno: studentId,
+              id_turma: classId,
+              inicio_vigencia: startDate,
+              fim_vigencia: null,
+              cancelada_em: null
+            };
+        }
+        return undefined;
+      },
+      update() {
+        if (table === "matricula") enrollmentUpdated = true;
+        return Promise.resolve(1);
+      },
+      then(resolve, reject) {
+        return Promise.resolve(table === "sessao" && isSessionList ? [session] : []).then(resolve, reject);
+      }
+    };
+    return query;
+  };
+
+  transaction.raw = (sql) => {
+    if (sql === "SELECT clock_timestamp() AS database_now") return { rows: [{ database_now: now }] };
+    if (sql === "SELECT CURRENT_DATE::text AS business_date") {
+      return { rows: [{ business_date: "2026-10-15" }] };
+    }
+    return sql;
+  };
+  transaction.transaction = async (callback) => {
+    const result = await callback(transaction);
+    if (enrollmentUpdated) cancellationCommitted = true;
+    return result;
+  };
+  transaction.cancellationCommitted = () => cancellationCommitted;
+  return transaction;
 }
 
 test("class list and detail read representations derive isClosed consistently", async () => {
@@ -417,4 +514,174 @@ test("enrollment cancellation rejects origins, IDs, and dates before domain acce
     assert.equal(record.result, "rejected");
   }
   assert.equal(JSON.stringify(records).includes("request-secret"), false);
+});
+
+test("successful enrollment cancellation emits one minimal audit event for each mode", async () => {
+  const previousNodeEnv = process.env.NODE_ENV;
+  try {
+    for (const nodeEnv of ["development", "production"]) {
+      process.env.NODE_ENV = nodeEnv;
+      for (const cancellationMode of ["immediate", "date_based"]) {
+        const actorId = "41";
+        const studentId = "73";
+        const classId = "8";
+        const enrollmentId = cancellationMode === "immediate" ? "91" : "92";
+        const token = cancellationMode === "immediate" ? "a".repeat(43) : "b".repeat(43);
+        const startDate = "2026-10-20";
+        const cancellationDate = cancellationMode === "date_based" ? "2026-10-22" : undefined;
+        const knex = cancellationKnex({ actorId, token, studentId, classId, enrollmentId, startDate });
+        const handlers = createAdminEnrollmentHandlers({ getDatabase: () => knex, allowedOrigins: [allowedOrigin] });
+        const logs = [];
+        const context = {
+          invocationId: "synthetic-cancel-audit-" + cancellationMode,
+          log(message) {
+            assert.equal(knex.cancellationCommitted(), true);
+            logs.push(message);
+          }
+        };
+        const ifMatch = strongEtag({
+          enrollmentId,
+          studentId,
+          classId,
+          startDate,
+          cancellationDate: null,
+          cancellationRequestedAt: null
+        });
+        const cancelRequest = request("POST", {
+          cookie: token,
+          params: { enrollmentId },
+          body: cancellationDate === undefined ? {} : { cancellationDate }
+        });
+        cancelRequest.headers.set("if-match", ifMatch);
+
+        const response = await handlers.cancelEnrollment(cancelRequest, context);
+        assert.equal(response.status, 204);
+        assert.equal(logs.length, 1);
+        const record = JSON.parse(logs[0]);
+        assert.deepEqual(Object.keys(record).sort(), [
+          "actorId", "cancellationMode", "enrollmentId", "event", "invocationId", "result"
+        ]);
+        assert.deepEqual(record, {
+          event: "admin_enrollment_cancel",
+          actorId,
+          enrollmentId,
+          cancellationMode,
+          result: "completed",
+          invocationId: context.invocationId
+        });
+        const serialized = JSON.stringify(record);
+        const excludedValues = [studentId, classId, token, startDate];
+        if (cancellationDate !== undefined) excludedValues.push(cancellationDate);
+        for (const excludedValue of excludedValues) assert.equal(serialized.includes(excludedValue), false);
+      }
+    }
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+  }
+});
+
+test("a cancellation rejected by the service emits no enriched audit event", async () => {
+  const previousNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = "development";
+  try {
+    const actorId = "43";
+    const studentId = "75";
+    const classId = "10";
+    const enrollmentId = "96";
+    const token = "f".repeat(43);
+    const startDate = "2026-10-15";
+    const knex = cancellationKnex({ actorId, token, studentId, classId, enrollmentId, startDate });
+    const handlers = createAdminEnrollmentHandlers({ getDatabase: () => knex, allowedOrigins: [allowedOrigin] });
+    const logs = [];
+    const cancelRequest = request("POST", { cookie: token, params: { enrollmentId }, body: {} });
+    cancelRequest.headers.set("if-match", strongEtag({
+      enrollmentId,
+      studentId,
+      classId,
+      startDate,
+      cancellationDate: null,
+      cancellationRequestedAt: null
+    }));
+
+    const response = await handlers.cancelEnrollment(cancelRequest, {
+      invocationId: "synthetic-cancel-rejected",
+      log(message) { logs.push(message); }
+    });
+    assertProblem(response, 422, "VALIDATION_ERROR");
+    assert.equal(knex.cancellationCommitted(), false);
+    assert.equal(logs.length, 1);
+    const record = JSON.parse(logs[0]);
+    assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
+    assert.equal(record.event, "admin_enrollment_cancel");
+    assert.equal(record.result, "rejected");
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+  }
+});
+
+test("enrollment cancellation logger failure preserves the response and production diagnostics stay off", async () => {
+  const previousNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  try {
+    const token = "c".repeat(43);
+    const enrollmentId = "93";
+    const studentId = "74";
+    const classId = "9";
+    const startDate = "2026-10-20";
+    const knex = cancellationKnex({
+      actorId: "42", token, studentId, classId, enrollmentId, startDate
+    });
+    const handlers = createAdminEnrollmentHandlers({ getDatabase: () => knex, allowedOrigins: [allowedOrigin] });
+    const cancelRequest = request("POST", { cookie: token, params: { enrollmentId }, body: {} });
+    cancelRequest.headers.set("if-match", strongEtag({
+      enrollmentId,
+      studentId,
+      classId,
+      startDate,
+      cancellationDate: null,
+      cancellationRequestedAt: null
+    }));
+    const response = await handlers.cancelEnrollment(cancelRequest, {
+      invocationId: "synthetic-cancel-logger-failure",
+      log() { throw new Error("synthetic logger failure"); }
+    });
+    assert.equal(response.status, 204);
+
+    const logs = [];
+    const rejectingHandlers = createAdminEnrollmentHandlers({
+      getDatabase() { throw new Error("synthetic database failure"); },
+      allowedOrigins: [allowedOrigin]
+    });
+    const invalidPath = await rejectingHandlers.cancelEnrollment(request("POST", {
+      params: { enrollmentId: "01" }, body: {}
+    }), { invocationId: "synthetic-production-rejection", log(message) { logs.push(message); } });
+    assertProblem(invalidPath, 400, "VALIDATION_ERROR");
+
+    const failedAuthorization = await rejectingHandlers.cancelEnrollment(request("POST", {
+      cookie: "d".repeat(43), params: { enrollmentId: "94" }, body: {}
+    }), { invocationId: "synthetic-production-failure", log(message) { logs.push(message); } });
+    assert.equal(failedAuthorization.status, 500);
+    assert.deepEqual(logs, []);
+
+    process.env.NODE_ENV = "development";
+    const developmentLogs = [];
+    const developmentHandlers = createAdminEnrollmentHandlers({
+      getDatabase() { throw new Error("synthetic database failure"); },
+      allowedOrigins: [allowedOrigin]
+    });
+    const developmentFailure = await developmentHandlers.cancelEnrollment(request("POST", {
+      cookie: "e".repeat(43), params: { enrollmentId: "95" }, body: {}
+    }), { invocationId: "synthetic-development-failure", log(message) { developmentLogs.push(message); } });
+    assert.equal(developmentFailure.status, 500);
+    assert.equal(developmentLogs.length, 1);
+    const failureRecord = JSON.parse(developmentLogs[0]);
+    assert.deepEqual(Object.keys(failureRecord).sort(), ["durationMs", "event", "invocationId", "result"]);
+    assert.equal(failureRecord.event, "admin_enrollment_cancel");
+    assert.equal(failureRecord.result, "failed");
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+  }
 });

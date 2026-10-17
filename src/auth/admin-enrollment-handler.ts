@@ -2,7 +2,7 @@ import type { HttpRequest, HttpResponseInit, InvocationContext } from "@azure/fu
 import type { Knex } from "knex";
 import { z } from "zod";
 import { getKnex } from "../database/knex";
-import { withSecurityEvent } from "../http/security-event";
+import { logAdminEnrollmentCancellationAudit, withSecurityEvent } from "../http/security-event";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
 import { ifMatchProblem, readIfMatch } from "../http/etag";
 import {
@@ -20,7 +20,7 @@ const MAX_POSTGRES_ID = 9223372036854775807n;
 const idSchema = z.string().refine((value) => /^[1-9]\d{0,18}$/.test(value)
   && BigInt(value) <= MAX_POSTGRES_ID);
 const cancellationPathSchema = z.strictObject({ enrollmentId: idSchema });
-const cancellationBodySchema = z.strictObject({ cancellationDate: z.iso.date() });
+const cancellationBodySchema = z.strictObject({ cancellationDate: z.iso.date().optional() });
 const createPathSchema = z.strictObject({ classId: idSchema });
 const createBodySchema = z.strictObject({
   studentId: idSchema,
@@ -266,7 +266,7 @@ export function createAdminEnrollmentHandlers(options: AdminEnrollmentHandlerOpt
     }
   };
 
-  const cancel: RequestHandler = withSecurityEvent("admin_enrollment_cancel", async (request) => {
+  const cancel: RequestHandler = withSecurityEvent("admin_enrollment_cancel", async (request, context) => {
     const rejected = mutationRejection(request, allowedOrigins);
     if (rejected) return rejected;
 
@@ -310,12 +310,24 @@ export function createAdminEnrollmentHandlers(options: AdminEnrollmentHandlerOpt
           "A data efetiva do cancelamento deve ser posterior ao início da matrícula."
         );
       }
+      if (result.status === "date-required") {
+        return invalidCancellationDate(
+          "/cancellationDate",
+          "Informe a data efetiva para cancelar uma matrícula que já começou."
+        );
+      }
+      if (result.status !== "cancelled") return internalFailure();
+      logAdminEnrollmentCancellationAudit(context, {
+        actorId: authorized.user.id,
+        enrollmentId: route.data.enrollmentId,
+        cancellationMode: body.data.cancellationDate === undefined ? "immediate" : "date_based"
+      });
       return { status: 204, headers: { "cache-control": "no-store" } };
     } catch (error) {
       if (sessionWasRevoked(error)) return authenticationRequired();
       return internalFailure();
     }
-  });
+  }, { suppressCompleted: true });
 
   return { createEnrollment: create, getEnrollment: detail, cancelEnrollment: cancel };
 }
